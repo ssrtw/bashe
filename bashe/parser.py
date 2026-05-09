@@ -536,9 +536,149 @@ def expression_statement(ts_node, ctx):
     return res
 
 
+@_handler("clone_expression")
+def clone_expr(ts_node, ctx):
+    nc = ts_node.named_children
+    return php.Clone(ctx.translate(nc[0]) if nc else None, **ctx.lineno(ts_node))
+
+
+@_handler("print_intrinsic")
+def print_intrinsic(ts_node, ctx):
+    nc = ts_node.named_children
+    return php.Print(ctx.translate(nc[0]) if nc else None, **ctx.lineno(ts_node))
+
+
+@_handler("break_statement")
+def break_stmt(ts_node, ctx):
+    nc = ts_node.named_children
+    depth = ctx.translate(nc[0]) if nc else None
+    return php.Break(depth, **ctx.lineno(ts_node))
+
+
+@_handler("continue_statement")
+def continue_stmt(ts_node, ctx):
+    nc = ts_node.named_children
+    depth = ctx.translate(nc[0]) if nc else None
+    return php.Continue(depth, **ctx.lineno(ts_node))
+
+
+@_handler("unset_statement")
+def unset_stmt(ts_node, ctx):
+    vars_ = [ctx.translate(c) for c in ts_node.named_children]
+    return php.Unset(vars_, **ctx.lineno(ts_node))
+
+
 @_handler("parenthesized_expression")
 def parenthesized(ts_node, ctx):
     return ctx.translate(ts_node.named_children[0])
+
+
+@_handler("error_suppression_expression")
+def error_suppression(ts_node, ctx):
+    nc = ts_node.named_children
+    return php.Silence(ctx.translate(nc[0]) if nc else None, **ctx.lineno(ts_node))
+
+
+@_handler("while_statement")
+def while_stmt(ts_node, ctx):
+    nc = ts_node.named_children
+    cond = ctx.translate(nc[0]) if nc else None
+    body = ctx.translate(nc[1]) if len(nc) > 1 else php.Block([], **ctx.lineno(ts_node))
+    body_stmts = body.nodes if isinstance(body, php.Block) else [body]
+    return php.While(cond, php.Block(body_stmts), **ctx.lineno(ts_node))
+
+
+@_handler("do_statement")
+def do_stmt(ts_node, ctx):
+    nc = ts_node.named_children
+    body = ctx.translate(nc[0]) if nc else php.Block([], **ctx.lineno(ts_node))
+    body_stmts = body.nodes if isinstance(body, php.Block) else [body]
+    cond = ctx.translate(nc[1]) if len(nc) > 1 else None
+    return php.DoWhile(php.Block(body_stmts), cond, **ctx.lineno(ts_node))
+
+
+@_handler("for_statement")
+def for_stmt(ts_node, ctx):
+    nc = ts_node.named_children
+    start = ctx.translate(nc[0]) if len(nc) > 0 else None
+    test = ctx.translate(nc[1]) if len(nc) > 1 else None
+    count = ctx.translate(nc[2]) if len(nc) > 2 else None
+    body_node = nc[3] if len(nc) > 3 else None
+    body = ctx.translate(body_node) if body_node else php.Block([], **ctx.lineno(ts_node))
+    body_stmts = body.nodes if isinstance(body, php.Block) else [body]
+    return php.For(start, test, count, php.Block(body_stmts), **ctx.lineno(ts_node))
+
+
+@_handler("switch_statement")
+def switch_stmt(ts_node, ctx):
+    nc = ts_node.named_children
+    expr = ctx.translate(nc[0]) if nc else None
+    switch_block = nc[1] if len(nc) > 1 else None
+    cases = ctx.translate(switch_block) if switch_block else []
+    return php.Switch(expr, cases, **ctx.lineno(ts_node))
+
+
+@_handler("switch_block", "case_statement", "default_statement")
+def switch_block(ts_node, ctx):
+    if ts_node.type == "switch_block":
+        result = []
+        for c in ts_node.named_children:
+            res = ctx.translate(c)
+            if res is not None:
+                result.append(res)
+        return result
+    nodes = []
+    for i, c in enumerate(ts_node.named_children):
+        if ts_node.type == "case_statement" and i == 0:
+            continue
+        res = ctx.translate(c)
+        if res is not None:
+            if isinstance(res, list):
+                nodes.extend(res)
+            else:
+                nodes.append(res)
+    if ts_node.type == "case_statement":
+        expr_n = ts_node.child_by_field_name("value")
+        expr = ctx.translate(expr_n) if expr_n else None
+        return php.Case(expr, nodes, **ctx.lineno(ts_node))
+    return php.Default(nodes, **ctx.lineno(ts_node))
+
+
+@_handler("interface_declaration")
+def interface_decl(ts_node, ctx):
+    name = ctx.text(ts_node.child_by_field_name("name"))
+    extends = None
+    for c in ts_node.named_children:
+        if c.type == "base_clause":
+            ext_names = [ctx.text(nc) for nc in c.named_children]
+            extends = ext_names[0] if len(ext_names) == 1 else ext_names
+            break
+    body_node = ts_node.child_by_field_name("body")
+    body = []
+    if body_node:
+        for c in body_node.children:
+            if c.type in ("{", "}", ";", None):
+                continue
+            res = ctx.translate(c)
+            if res is not None:
+                if isinstance(res, list):
+                    body.extend(res)
+                else:
+                    body.append(res)
+    return php.Interface(name, extends, body, **ctx.lineno(ts_node))
+
+
+@_handler("function_static_declaration")
+def function_static_decl(ts_node, ctx):
+    vars_ = []
+    for c in ts_node.named_children:
+        name_node = c.child_by_field_name("name")
+        value_node = c.child_by_field_name("value")
+        name = ctx.text(name_node) if name_node else None
+        value = ctx.translate(value_node) if value_node else None
+        v = php.StaticVariable(name, value, **ctx.lineno(c))
+        vars_.append(v)
+    return php.Static(vars_, **ctx.lineno(ts_node))
 
 
 @_handler("return_statement")
@@ -557,6 +697,23 @@ def exit_stmt(ts_node, ctx):
             break
     t = "exit" if "exit" in ctx.text(ts_node).lower() else "die"
     return php.Exit(arg, t, **ctx.lineno(ts_node))
+
+
+@_handler(
+    "include_expression",
+    "include_once_expression",
+    "require_expression",
+    "require_once_expression",
+)
+def include_expr(ts_node, ctx):
+    nc = ts_node.named_children
+    expr = ctx.translate(nc[0]) if nc else None
+    t = ts_node.type
+    once = "once" in t
+    if t.startswith("include"):
+        return php.Include(expr, once, **ctx.lineno(ts_node))
+    else:
+        return php.Require(expr, once, **ctx.lineno(ts_node))
 
 
 @_handler("global_statement", "global_declaration")
@@ -674,13 +831,20 @@ def namespace_use_clause(ts_node, ctx):
 
 @_handler("assignment_expression", "augmented_assignment_expression")
 def assignment(ts_node, ctx):
-    left = ctx.translate(ts_node.child_by_field_name("left"))
+    left_node = ts_node.child_by_field_name("left")
+    left = ctx.translate(left_node)
     right = ctx.translate(ts_node.child_by_field_name("right"))
     op_node = next(
         (c for c in ts_node.children if not c.is_named and "=" in ctx.text(c)), None
     )
     op = ctx.text(op_node).strip() if op_node else "="
     if op == "=":
+        if left_node and left_node.type == "list_literal":
+            return php.ListAssignment(
+                left if isinstance(left, list) else [left],
+                right,
+                **ctx.lineno(ts_node),
+            )
         return php.Assignment(left, right, False, **ctx.lineno(ts_node))
     if op == "=&":
         return php.Assignment(left, right, True, **ctx.lineno(ts_node))
@@ -697,12 +861,15 @@ def reference_assignment(ts_node, ctx):
 
 @_handler("update_expression")
 def update_expr(ts_node, ctx):
-    var = ctx.translate(ts_node.named_children[0])
     op_text = ""
     for c in ts_node.children:
         if not c.is_named:
             op_text += ctx.text(c).strip()
-    return php.PostIncDecOp(op_text, var, **ctx.lineno(ts_node))
+    nc = ts_node.named_children
+    var = ctx.translate(nc[0]) if nc else None
+    if ts_node.children[0].is_named:
+        return php.PostIncDecOp(op_text, var, **ctx.lineno(ts_node))
+    return php.PreIncDecOp(op_text, var, **ctx.lineno(ts_node))
 
 
 @_handler("unary_op_expression")
@@ -917,6 +1084,12 @@ def function_call(ts_node, ctx):
                 [a.node if isinstance(a, php.Parameter) else a for a in args],
                 **ctx.lineno(ts_node),
             )
+        if nl == "empty":
+            arg = args[0].node if args else None
+            return php.Empty(arg, **ctx.lineno(ts_node))
+        if nl == "eval":
+            arg = args[0].node if args else None
+            return php.Eval(arg, **ctx.lineno(ts_node))
     return php.FunctionCall(name, args, **ctx.lineno(ts_node))
 
 

@@ -6,6 +6,8 @@ from phply.phpast import (
     AssignOp,
     BinaryOp,
     Block,
+    Break,
+    Case,
     Cast,
     Catch,
     Class,
@@ -13,17 +15,24 @@ from phply.phpast import (
     ClassConstants,
     ClassVariable,
     ClassVariables,
+    Clone,
     Closure,
     Constant,
     ConstantDeclaration,
     ConstantDeclarations,
+    Continue,
     Declare,
+    Default,
     Directive,
+    DoWhile,
     Echo,
     Else,
     ElseIf,
+    Empty,
+    Eval,
     Exit,
     Finally,
+    For,
     Foreach,
     ForeachVariable,
     FormalParameter,
@@ -31,9 +40,12 @@ from phply.phpast import (
     FunctionCall,
     Global,
     If,
+    Include,
     InlineHTML,
+    Interface,
     IsSet,
     LexicalVariable,
+    ListAssignment,
     MagicConstant,
     Method,
     MethodCall,
@@ -42,10 +54,17 @@ from phply.phpast import (
     ObjectProperty,
     Parameter,
     PostIncDecOp,
+    PreIncDecOp,
+    Print,
+    Require,
     Return,
+    Silence,
+    Static,
     StaticMethodCall,
     StaticProperty,
+    StaticVariable,
     StringOffset,
+    Switch,
     TernaryOp,
     Throw,
     Trait,
@@ -53,11 +72,14 @@ from phply.phpast import (
     TraitUse,
     Try,
     UnaryOp,
+    Unset,
     UseDeclaration,
     UseDeclarations,
     Variable,
+    While,
     Yield,
 )
+
 from bashe.parser import Bashe
 
 parser = Bashe()
@@ -1330,3 +1352,152 @@ def test_exit_loc():
                exit(1); """
     expected = [Exit(1, "exit", lineno=2)]
     eq_ast(input, expected, with_top_lineno=True)
+
+
+def test_include_file():
+    input = """<?php
+    include("test1.php");
+    include "test2.php";
+    include_once "test3.php";
+    """
+    expected = [
+        Include("test1.php", False, lineno=2),
+        Include("test2.php", False, lineno=3),
+        Include("test3.php", True, lineno=4),
+    ]
+    eq_ast(input, expected, with_top_lineno=True)
+
+
+def test_require_file():
+    input = "<?php require('a.php'); require_once 'b.php';"
+    expected = [
+        Require("a.php", False),
+        Require("b.php", True),
+    ]
+    eq_ast(input, expected)
+
+
+def test_clone():
+    input = "<?php clone $obj;"
+    expected = [Clone(Variable("$obj"))]
+    eq_ast(input, expected)
+
+
+def test_break_continue():
+    input = "<?php break; break 2; continue; continue 3;"
+    expected = [
+        Break(None),
+        Break(2),
+        Continue(None),
+        Continue(3),
+    ]
+    eq_ast(input, expected)
+
+
+def test_print():
+    input = "<?php print $x;"
+    expected = [Print(Variable("$x"))]
+    eq_ast(input, expected)
+
+
+def test_unset():
+    input = "<?php unset($x, $y);"
+    expected = [Unset([Variable("$x"), Variable("$y")])]
+    eq_ast(input, expected)
+
+
+def test_pre_inc_dec():
+    input = "<?php ++$i; --$j;"
+    expected = [
+        PreIncDecOp("++", Variable("$i")),
+        PreIncDecOp("--", Variable("$j")),
+    ]
+    eq_ast(input, expected)
+
+
+def test_empty_expr():
+    input = "<?php empty($x);"
+    expected = [Empty(Variable("$x"))]
+    eq_ast(input, expected)
+
+
+def test_eval_expr():
+    input = "<?php eval(\"echo 1;\");"
+    expected = [Eval("echo 1;")]
+    eq_ast(input, expected)
+
+
+def test_silence():
+    input = "<?php @$x;"
+    expected = [Silence(Variable("$x"))]
+    eq_ast(input, expected)
+
+
+def test_static_variables():
+    input = "<?php static $x = 1, $y;"
+    expected = [
+        Static([
+            StaticVariable("$x", 1),
+            StaticVariable("$y", None),
+        ])
+    ]
+    eq_ast(input, expected)
+
+
+def test_while_loop():
+    input = "<?php while($x) { break; }"
+    expected = [
+        While(Variable("$x"), Block([Break(None)])),
+    ]
+    eq_ast(input, expected)
+
+
+def test_do_while():
+    input = "<?php do { continue; } while($y);"
+    expected = [
+        DoWhile(Block([Continue(None)]), Variable("$y")),
+    ]
+    eq_ast(input, expected)
+
+
+def test_for_loop():
+    input = "<?php for($i=0; $i<10; $i++) { echo $i; }"
+    expected = [
+        For(
+            Assignment(Variable("$i"), 0, False),
+            BinaryOp("<", Variable("$i"), 10),
+            PostIncDecOp("++", Variable("$i")),
+            Block([Echo([Variable("$i")])]),
+        )
+    ]
+    eq_ast(input, expected)
+
+
+def test_switch_case_default():
+    input = "<?php switch($x) { case 1: echo 1; break; default: echo 2; }"
+    expected = [
+        Switch(
+            Variable("$x"),
+            [
+                Case(1, [Echo([1]), Break(None)]),
+                Default([Echo([2])]),
+            ],
+        )
+    ]
+    eq_ast(input, expected)
+
+
+def test_interface():
+    input = "<?php interface Foo extends Bar { function f(); }"
+    expected = [
+        Interface("Foo", "Bar", [Method("f", [], [], [], False)]),
+    ]
+    eq_ast(input, expected)
+
+
+def test_list_assignment():
+    input = "<?php list($a, $b) = $arr;"
+    expected = [
+        ListAssignment([Variable("$a"), Variable("$b")], Variable("$arr")),
+    ]
+    eq_ast(input, expected)
