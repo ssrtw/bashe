@@ -40,6 +40,12 @@ jobs:
           name: dist
           path: dist/
 
+      - name: Assert native types are loaded
+        run: uv run --isolated --with dist/*.whl python -c "
+          from bashe.parser import php
+          assert php.__name__ == 'bashe.types', f'got {php.__name__}'
+          "
+
       - name: Test (native types)
         run: uv run --isolated --with dist/*.whl --with pytest pytest test/ -q
 
