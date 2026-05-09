@@ -41,10 +41,10 @@ jobs:
           path: dist/
 
       - name: Test (native types)
-        run: uv run --with dist/*.whl --with pytest -p no:warnings pytest test/ -q
+        run: uv run --with dist/*.whl --with pytest pytest test/ -q
 
       - name: Test (phply compat)
-        run: uv run --with dist/*.whl --with phply --with pytest -p no:warnings pytest test/ -q
+        run: uv run --with dist/*.whl --with phply --with pytest pytest test/ -q
 
   publish:
     needs: test
