@@ -57,9 +57,7 @@ from phply.phpast import (
     UseDeclarations,
     Variable,
     Yield,
-    resolve_magic_constants,
 )
-
 from bashe.parser import Bashe
 
 parser = Bashe()
@@ -67,7 +65,6 @@ parser = Bashe()
 
 def eq_ast(input, expected, filename=None, with_top_lineno=False):
     output = parser.parse(input, filename)
-    resolve_magic_constants(output)
 
     try:
         for out, exp in zip(output, expected):

@@ -152,7 +152,18 @@ def _scope_text(scope_node, ctx):
 
 
 class Ctx:
-    __slots__ = ("source", "echo_mode", "string_mode", "lineno_dict", "filename")
+    __slots__ = (
+        "source",
+        "echo_mode",
+        "string_mode",
+        "lineno_dict",
+        "filename",
+        "ns",
+        "fn",
+        "cls",
+        "method",
+        "trait",
+    )
 
     def __init__(self, source: bytes, filename: str = None):
         self.source = source
@@ -160,6 +171,11 @@ class Ctx:
         self.string_mode = False
         self.lineno_dict = {}
         self.filename = filename
+        self.ns = None
+        self.fn = None
+        self.cls = None
+        self.method = None
+        self.trait = None
 
     def text(self, n):
         return self.source[n.start_byte : n.end_byte].decode("utf8") if n else ""
@@ -257,6 +273,12 @@ def _handler(*types):
 
 @_handler("program", "namespace_definition", "declaration_list")
 def top_level(ts_node, ctx):
+    old_ns = ctx.ns
+    name = None
+    if ts_node.type == "namespace_definition":
+        name = ctx.text(ts_node.child_by_field_name("name")) or None
+        ctx.ns = name
+
     nodes = []
 
     def process(children):
@@ -332,10 +354,15 @@ def top_level(ts_node, ctx):
     process(ts_node.children)
 
     if ts_node.type == "namespace_definition":
-        name = ctx.text(ts_node.child_by_field_name("name")) or None
         if len(nodes) == 1 and isinstance(nodes[0], php.Block):
             nodes = nodes[0].nodes
-        return php.Namespace(name, nodes, **ctx.lineno(ts_node))
+        result = php.Namespace(name, nodes, **ctx.lineno(ts_node))
+        has_body = any(
+            c.type == "declaration_list" for c in ts_node.children
+        )
+        if has_body:
+            ctx.ns = old_ns
+        return result
     return nodes
 
 
@@ -423,6 +450,16 @@ def name(ts_node, ctx):
             value = ctx.filename
         elif txt == "__DIR__":
             value = os.path.dirname(ctx.filename) if ctx.filename else None
+        elif txt == "__NAMESPACE__":
+            value = ctx.ns
+        elif txt == "__CLASS__":
+            value = ctx.cls
+        elif txt == "__FUNCTION__":
+            value = ctx.fn
+        elif txt == "__METHOD__":
+            value = ctx.method
+        elif txt == "__TRAIT__":
+            value = ctx.trait
         return php.MagicConstant(txt, value, **ctx.lineno(ts_node))
     return php.Constant(txt, **ctx.lineno(ts_node))
 
@@ -1086,6 +1123,8 @@ def property_decl(ts_node, ctx):
 
 @_handler("method_declaration")
 def method_decl(ts_node, ctx):
+    old_method = ctx.method
+    old_fn = ctx.fn
     modifiers = []
     for c in ts_node.children:
         if c.type == "visibility_modifier":
@@ -1097,18 +1136,26 @@ def method_decl(ts_node, ctx):
         elif c.type == "abstract_modifier":
             modifiers.append("abstract")
     name = ctx.text(ts_node.child_by_field_name("name"))
+    qualified = f"{ctx.cls}::{name}" if ctx.cls else name
+    ctx.method = qualified
+    ctx.fn = qualified
     params_node = ts_node.child_by_field_name("parameters")
     params = [
         ctx.translate(p) for p in (params_node.named_children if params_node else [])
     ]
     body = ctx.translate(ts_node.child_by_field_name("body"))
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
-    return php.Method(name, modifiers, params, body_stmts, False, **ctx.lineno(ts_node))
+    result = php.Method(name, modifiers, params, body_stmts, False, **ctx.lineno(ts_node))
+    ctx.method = old_method
+    ctx.fn = old_fn
+    return result
 
 
 @_handler("class_declaration")
 def class_decl(ts_node, ctx):
+    old_cls = ctx.cls
     name = ctx.text(ts_node.child_by_field_name("name"))
+    ctx.cls = f"{ctx.ns}\\{name}" if ctx.ns else name
     modifiers = []
     base_name = None
     interfaces = []
@@ -1153,7 +1200,7 @@ def class_decl(ts_node, ctx):
                     else:
                         body.append(res)
 
-    return php.Class(
+    result = php.Class(
         name,
         modifiers[0] if modifiers else None,
         base_name,
@@ -1162,11 +1209,18 @@ def class_decl(ts_node, ctx):
         body,
         **ctx.lineno(ts_node),
     )
+    ctx.cls = old_cls
+    return result
 
 
 @_handler("trait_declaration")
 def trait_decl(ts_node, ctx):
+    old_trait = ctx.trait
+    old_cls = ctx.cls
     name = ctx.text(ts_node.child_by_field_name("name"))
+    full_name = f"{ctx.ns}\\{name}" if ctx.ns else name
+    ctx.trait = full_name
+    ctx.cls = full_name
     body_node = ts_node.child_by_field_name("body")
     body = []
     uses = []
@@ -1185,19 +1239,26 @@ def trait_decl(ts_node, ctx):
                         body.extend(res)
                     else:
                         body.append(res)
-    return php.Trait(name, uses, body, **ctx.lineno(ts_node))
+    result = php.Trait(name, uses, body, **ctx.lineno(ts_node))
+    ctx.trait = old_trait
+    ctx.cls = old_cls
+    return result
 
 
 @_handler("function_definition")
 def function_def(ts_node, ctx):
+    old_fn = ctx.fn
     name = ctx.text(ts_node.child_by_field_name("name"))
+    ctx.fn = f"{ctx.ns}\\{name}" if ctx.ns else name
     params_node = ts_node.child_by_field_name("parameters")
     params = [
         ctx.translate(p) for p in (params_node.named_children if params_node else [])
     ]
     body = ctx.translate(ts_node.child_by_field_name("body"))
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
-    return php.Function(name, params, body_stmts, False, **ctx.lineno(ts_node))
+    result = php.Function(name, params, body_stmts, False, **ctx.lineno(ts_node))
+    ctx.fn = old_fn
+    return result
 
 
 @_handler("simple_parameter")
