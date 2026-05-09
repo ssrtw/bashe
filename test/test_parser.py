@@ -3,6 +3,7 @@ try:
 except ImportError:
     from bashe.types import *  # noqa: F403
 
+from bashe.utils import F
 from test.util import eq_ast
 
 
@@ -879,7 +880,7 @@ def test_magic_constants():
     ?>"""
     expected = [
         Namespace("Shmamespace", []),
-        Function(
+        F(Function,
             "p",
             [FormalParameter("$x", None, False, None)],
             [
@@ -902,7 +903,6 @@ def test_magic_constants():
                 )
             ],
             False,
-            None,
         ),
         Class(
             "Bar",
@@ -974,7 +974,7 @@ def test_type_hinting():
     }
     ?>"""
     expected = [
-        Function(
+        F(Function,
             "foo",
             [
                 FormalParameter("$var1", None, False, "Foo"),
@@ -985,7 +985,6 @@ def test_type_hinting():
             ],
             [],
             False,
-            None,
         )
     ]
     eq_ast(input, expected)
@@ -1075,8 +1074,8 @@ def test_array_literal():
 def test_array_in_default_arg():
     input = "<? function f($a=[]){} function g($a=array()){}"
     expected = [
-        Function("f", [FormalParameter("$a", Array([]), False, None)], [], False, None),
-        Function("g", [FormalParameter("$a", Array([]), False, None)], [], False, None),
+        F(Function, "f", [FormalParameter("$a", Array([]), False, None)], [], False),
+        F(Function, "g", [FormalParameter("$a", Array([]), False, None)], [], False),
     ]
     eq_ast(input, expected)
 
@@ -1208,7 +1207,7 @@ def test_result_multiple_offsets():
 def test_yield():
     input = """<? function f() { yield; yield 1; }"""
     expected = [
-        Function(
+        F(Function,
             "f",
             [],
             [
@@ -1216,7 +1215,6 @@ def test_yield():
                 Yield(1),
             ],
             False,
-            None,
         ),
     ]
     eq_ast(input, expected)

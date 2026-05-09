@@ -5,6 +5,8 @@ import os
 import tree_sitter_php as tsphp
 from tree_sitter import Language, Parser
 
+from .utils import F
+
 
 class _PhpAstProxy:
     _module = None
@@ -23,7 +25,12 @@ class _PhpAstProxy:
         return _PhpAstProxy._module
 
     def __getattr__(self, name):
-        return getattr(self._load(), name)
+        try:
+            return getattr(self._load(), name)
+        except AttributeError:
+            from . import types
+
+            return getattr(types, name)
 
 
 php = _PhpAstProxy()
@@ -1502,7 +1509,7 @@ def function_def(ts_node, ctx):
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
     return_type_node = ts_node.child_by_field_name("return_type")
     return_type = ctx.text(return_type_node) if return_type_node else None
-    result = php.Function(name, params, body_stmts, False, return_type, **ctx.lineno(ts_node))
+    result = F(php.Function, name, params, body_stmts, False, return_type, **ctx.lineno(ts_node))
     ctx.fn = old_fn
     return result
 

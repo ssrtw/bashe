@@ -4,6 +4,16 @@ Uses native ``bashe.types`` types exclusively — no phply compatibility
 required for these modern PHP features.
 """
 
+import pytest
+
+from bashe.parser import php as _php
+
+if _php.__name__ != "bashe.types":
+    pytest.skip(
+        "phply active — PHP 7/8 native tests require bashe.types",
+        allow_module_level=True,
+    )
+
 from bashe.types import (
     Array,
     ArrayElement,
@@ -29,9 +39,7 @@ from bashe.types import (
     TraitUse,
     Variable,
 )
-
 from test.util import eq_ast
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # PHP 5.4+
@@ -209,14 +217,16 @@ echo match($user->name) {
 };
 """
     expected = [
-        Echo([
-            MatchExpr(
-                ObjectProperty(Variable("$user"), "name"),
-                [
-                    MatchArm("Alice", "管理者"),
-                    MatchArm(None, "一般用戶"),
-                ],
-            )
-        ]),
+        Echo(
+            [
+                MatchExpr(
+                    ObjectProperty(Variable("$user"), "name"),
+                    [
+                        MatchArm("Alice", "管理者"),
+                        MatchArm(None, "一般用戶"),
+                    ],
+                )
+            ]
+        ),
     ]
     eq_ast(input, expected)

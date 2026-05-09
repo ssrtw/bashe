@@ -219,9 +219,11 @@ TraitModifier = _node("TraitModifier", ["from", "to", "visibility"])
 
 # ── PHP 7+ types (not in phply) ────────────────────────────────────
 
+
 Function = _node(  # overrides phply-compat: adds return_type
     "Function", ["name", "params", "nodes", "is_ref", "return_type"]
 )
+
 
 # ── PHP 8.0+ types ─────────────────────────────────────────────────
 
