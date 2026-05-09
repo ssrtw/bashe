@@ -3,31 +3,7 @@ try:
 except ImportError:
     from bashe.types import *  # noqa: F403
 
-from bashe.parser import Bashe
-
-parser = Bashe()
-
-
-def eq_ast(input, expected, filename=None, with_top_lineno=False):
-    output = parser.parse(input, filename)
-
-    try:
-        for out, exp in zip(output, expected):
-            assert out == exp, f"got {out}, {exp}"
-
-            # compare line numbers, but only for top elements
-            if with_top_lineno:
-                assert out.lineno == exp.lineno, (
-                    f"got line: {out.lineno}, expected:{exp.lineno}"
-                )
-
-        assert len(output) == len(expected)
-    except AssertionError as e:
-        print("except!")
-        print(f"tspp output: {output}")
-        print(f"expected: {expected}")
-        print(f"tspp len: {len(output)}, expected len: {len(expected)}")
-        raise e
+from test.util import eq_ast
 
 
 def test_inline_html():
@@ -857,9 +833,9 @@ def test_closures():
                             Parameter(Variable("$name"), False),
                         ],
                     )
-                ],
-                False,
-            ),
+            ],
+            False,
+        ),
             False,
         ),
         FunctionCall(Variable("$greet"), [Parameter("World", False)]),
@@ -926,6 +902,7 @@ def test_magic_constants():
                 )
             ],
             False,
+            None,
         ),
         Class(
             "Bar",
@@ -1008,6 +985,7 @@ def test_type_hinting():
             ],
             [],
             False,
+            None,
         )
     ]
     eq_ast(input, expected)
@@ -1097,8 +1075,8 @@ def test_array_literal():
 def test_array_in_default_arg():
     input = "<? function f($a=[]){} function g($a=array()){}"
     expected = [
-        Function("f", [FormalParameter("$a", Array([]), False, None)], [], False),
-        Function("g", [FormalParameter("$a", Array([]), False, None)], [], False),
+        Function("f", [FormalParameter("$a", Array([]), False, None)], [], False, None),
+        Function("g", [FormalParameter("$a", Array([]), False, None)], [], False, None),
     ]
     eq_ast(input, expected)
 
@@ -1238,6 +1216,7 @@ def test_yield():
                 Yield(1),
             ],
             False,
+            None,
         ),
     ]
     eq_ast(input, expected)

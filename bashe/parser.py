@@ -1,7 +1,8 @@
 """Tree-sitter PHP parser - refactored with dispatch table."""
 
-import tree_sitter_php as tsphp
 import os
+
+import tree_sitter_php as tsphp
 from tree_sitter import Language, Parser
 
 
@@ -12,7 +13,7 @@ class _PhpAstProxy:
     def _load():
         if _PhpAstProxy._module is None:
             try:
-                from phply import phpast as mod
+                from phply import phpast as mod  # type: ignore
 
                 _PhpAstProxy._module = mod
             except ImportError:
@@ -649,6 +650,39 @@ def switch_block(ts_node, ctx):
     return php.Default(nodes, **ctx.lineno(ts_node))
 
 
+@_handler("match_expression")
+def match_expr(ts_node, ctx):
+    cond = ctx.translate(ts_node.child_by_field_name("condition"))
+    body = ctx.translate(ts_node.child_by_field_name("body"))
+    return php.MatchExpr(cond, body or [], **ctx.lineno(ts_node))
+
+
+@_handler("match_block")
+def match_block_handler(ts_node, ctx):
+    return [ctx.translate(c) for c in ts_node.named_children]
+
+
+@_handler("match_conditional_expression")
+def match_conditional(ts_node, ctx):
+    cond_n = ts_node.child_by_field_name("conditional_expressions")
+    if cond_n is not None:
+        patterns = [ctx.translate(c) for c in cond_n.named_children]
+        if len(patterns) == 1:
+            pattern = patterns[0]
+        else:
+            pattern = patterns
+    else:
+        pattern = None
+    body = ctx.translate(ts_node.child_by_field_name("return_expression"))
+    return php.MatchArm(pattern, body, **ctx.lineno(ts_node))
+
+
+@_handler("match_default_expression")
+def match_default_handler(ts_node, ctx):
+    body = ctx.translate(ts_node.child_by_field_name("return_expression"))
+    return php.MatchArm(None, body, **ctx.lineno(ts_node))
+
+
 @_handler("interface_declaration")
 def interface_decl(ts_node, ctx):
     name = ctx.text(ts_node.child_by_field_name("name"))
@@ -1130,6 +1164,32 @@ def member_call(ts_node, ctx):
     return php.MethodCall(obj, name, args, **ctx.lineno(ts_node))
 
 
+@_handler("nullsafe_member_access_expression")
+def nullsafe_access(ts_node, ctx):
+    obj = ctx.translate(ts_node.child_by_field_name("object"))
+    name_n = ts_node.child_by_field_name("name")
+    name = (
+        ctx.translate(name_n)
+        if name_n and name_n.type == "variable_name"
+        else ctx.text(name_n)
+        if name_n
+        else ""
+    )
+    return php.NullsafePropertyAccess(obj, name, **ctx.lineno(ts_node))
+
+
+@_handler("nullsafe_member_call_expression")
+def nullsafe_call(ts_node, ctx):
+    obj = ctx.translate(ts_node.child_by_field_name("object"))
+    name_n = ts_node.child_by_field_name("name")
+    name = ctx.text(name_n) if name_n else ""
+    args = [
+        ctx.translate(a)
+        for a in ts_node.child_by_field_name("arguments").named_children
+    ]
+    return php.NullsafeCall(obj, name, args, **ctx.lineno(ts_node))
+
+
 @_handler("object_creation_expression")
 def new(ts_node, ctx):
     cls_node = None
@@ -1146,6 +1206,12 @@ def new(ts_node, ctx):
 
 @_handler("argument")
 def argument(ts_node, ctx):
+    name_node = ts_node.child_by_field_name("name")
+    if name_node:
+        value = ctx.translate(ts_node.named_children[-1])
+        return php.NamedArgument(
+            ctx.text(name_node), value, **ctx.lineno(ts_node)
+        )
     return php.Parameter(
         ctx.translate(ts_node.named_children[-1]),
         "&" in ctx.text(ts_node),
@@ -1434,7 +1500,9 @@ def function_def(ts_node, ctx):
     ]
     body = ctx.translate(ts_node.child_by_field_name("body"))
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
-    result = php.Function(name, params, body_stmts, False, **ctx.lineno(ts_node))
+    return_type_node = ts_node.child_by_field_name("return_type")
+    return_type = ctx.text(return_type_node) if return_type_node else None
+    result = php.Function(name, params, body_stmts, False, return_type, **ctx.lineno(ts_node))
     ctx.fn = old_fn
     return result
 
@@ -1454,6 +1522,23 @@ def simple_param(ts_node, ctx):
     )
     return php.FormalParameter(
         name, default_val, is_ref, type_name, **ctx.lineno(ts_node)
+    )
+
+
+@_handler("property_promotion_parameter")
+def property_promotion_param(ts_node, ctx):
+    modifiers = []
+    type_node = ts_node.child_by_field_name("type")
+    name_node = ts_node.child_by_field_name("name")
+    default_node = ts_node.child_by_field_name("default_value")
+    for c in ts_node.children:
+        if c.type == "visibility_modifier":
+            modifiers.append(ctx.text(c).strip().lower())
+    type_name = ctx.text(type_node) if type_node else None
+    name = ctx.text(name_node) if name_node else ""
+    default_val = ctx.translate(default_node) if default_node else None
+    return php.ConstructorParameter(
+        modifiers, name, type_name, default_val, **ctx.lineno(ts_node)
     )
 
 

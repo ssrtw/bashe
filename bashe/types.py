@@ -86,6 +86,15 @@ __all__ = [
     "ConstantDeclaration",
     "TraitUse",
     "TraitModifier",
+    # PHP 7+
+    # Function (redefined with return_type)
+    # PHP 8.0+
+    "MatchExpr",
+    "MatchArm",
+    "NamedArgument",
+    "NullsafePropertyAccess",
+    "NullsafeCall",
+    "ConstructorParameter",
 ]
 
 
@@ -108,9 +117,7 @@ class Node:
             setattr(self, field, args[i])
 
     def __repr__(self):
-        vals = ", ".join(
-            repr(getattr(self, f, None)) for f in self.fields
-        )
+        vals = ", ".join(repr(getattr(self, f, None)) for f in self.fields)
         return f"{self.__class__.__name__}({vals})"
 
     def __eq__(self, other):
@@ -209,3 +216,20 @@ ConstantDeclarations = _node("ConstantDeclarations", ["nodes"])
 ConstantDeclaration = _node("ConstantDeclaration", ["name", "initial"])
 TraitUse = _node("TraitUse", ["name", "renames"])
 TraitModifier = _node("TraitModifier", ["from", "to", "visibility"])
+
+# ── PHP 7+ types (not in phply) ────────────────────────────────────
+
+Function = _node(  # overrides phply-compat: adds return_type
+    "Function", ["name", "params", "nodes", "is_ref", "return_type"]
+)
+
+# ── PHP 8.0+ types ─────────────────────────────────────────────────
+
+MatchExpr = _node("MatchExpr", ["condition", "arms"])
+MatchArm = _node("MatchArm", ["pattern", "body"])
+NamedArgument = _node("NamedArgument", ["name", "node"])
+NullsafePropertyAccess = _node("NullsafePropertyAccess", ["node", "name"])
+NullsafeCall = _node("NullsafeCall", ["node", "name", "params"])
+ConstructorParameter = _node(
+    "ConstructorParameter", ["modifiers", "name", "type", "default"]
+)
