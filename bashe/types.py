@@ -101,9 +101,9 @@ __all__ = [
 class Node:
     """Base class for AST nodes.
 
-    Leverages the same ``fields`` / ``lineno`` protocol as phply's
-    :class:`phply.phpast.Node` so that native nodes and phply nodes are
-    interchangeable in tests and downstream code.
+    Implements the same ``fields`` / ``lineno`` protocol as
+    :class:`phply.phpast.Node` so native and phply nodes are
+    interchangeable.
     """
 
     fields = []
@@ -130,6 +130,40 @@ class Node:
 
     def __ne__(self, other):
         return not self.__eq__(other)
+
+    def accept(self, visitor):
+        """Call *visitor* on this node and every child node depth-first."""
+        visitor(self)
+        for field in self.fields:
+            value = getattr(self, field)
+            if isinstance(value, Node):
+                value.accept(visitor)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, Node):
+                        item.accept(visitor)
+
+    def generic(self, with_lineno=False):
+        """Return a ``(classname, dict)`` tuple for nested serialisation.
+
+        Matches the phply ``generic()`` protocol.
+        """
+        values = {}
+        if with_lineno:
+            values["lineno"] = self.lineno
+        for field in self.fields:
+            value = getattr(self, field)
+            if hasattr(value, "generic"):
+                value = value.generic(with_lineno)
+            elif isinstance(value, list):
+                items = value
+                value = []
+                for item in items:
+                    if hasattr(item, "generic"):
+                        item = item.generic(with_lineno)
+                    value.append(item)
+            values[field] = value
+        return (self.__class__.__name__, values)
 
 
 def _node(name, fields):
