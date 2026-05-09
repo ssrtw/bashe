@@ -1,0 +1,20 @@
+[project]
+name = "bashe"
+version = "0.1.0"
+description = "A Tree-sitter based PHP parser for Python, featuring compatibility with phply."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "tree-sitter>=0.25.2",
+  "tree-sitter-php>=0.24.1",
+]
+
+[project.optional-dependencies]
+phply = ["phply>=1.2.6"]
+
+[dependency-groups]
+dev = [
+  "ipykernel>=7.2.0",
+  "phply>=1.2.6",
+  "pytest>=7",
+]
