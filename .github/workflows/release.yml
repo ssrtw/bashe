@@ -42,14 +42,14 @@ jobs:
 
       - name: Assert native types are loaded
         run: |
-          uv run --isolated --with dist/*.whl python -c \
+          uv run --no-project --with dist/*.whl python -c \
             "from bashe.parser import php; assert php.__name__ == 'bashe.types', f'got {php.__name__}'"
 
       - name: Test (native types)
-        run: uv run --isolated --with dist/*.whl --with pytest pytest test/ -q
+        run: uv run --no-project --with dist/*.whl --with pytest pytest test/ -q
 
       - name: Test (phply compat)
-        run: uv run --isolated --with dist/*.whl --with phply --with pytest pytest test/test_parser.py -q
+        run: uv run --no-project --with dist/*.whl --with phply --with pytest pytest test/test_parser.py -q
 
   publish:
     needs: test
