@@ -1,84 +1,7 @@
-from phply.phpast import (
-    Array,
-    ArrayElement,
-    ArrayOffset,
-    Assignment,
-    AssignOp,
-    BinaryOp,
-    Block,
-    Break,
-    Case,
-    Cast,
-    Catch,
-    Class,
-    ClassConstant,
-    ClassConstants,
-    ClassVariable,
-    ClassVariables,
-    Clone,
-    Closure,
-    Constant,
-    ConstantDeclaration,
-    ConstantDeclarations,
-    Continue,
-    Declare,
-    Default,
-    Directive,
-    DoWhile,
-    Echo,
-    Else,
-    ElseIf,
-    Empty,
-    Eval,
-    Exit,
-    Finally,
-    For,
-    Foreach,
-    ForeachVariable,
-    FormalParameter,
-    Function,
-    FunctionCall,
-    Global,
-    If,
-    Include,
-    InlineHTML,
-    Interface,
-    IsSet,
-    LexicalVariable,
-    ListAssignment,
-    MagicConstant,
-    Method,
-    MethodCall,
-    Namespace,
-    New,
-    ObjectProperty,
-    Parameter,
-    PostIncDecOp,
-    PreIncDecOp,
-    Print,
-    Require,
-    Return,
-    Silence,
-    Static,
-    StaticMethodCall,
-    StaticProperty,
-    StaticVariable,
-    StringOffset,
-    Switch,
-    TernaryOp,
-    Throw,
-    Trait,
-    TraitModifier,
-    TraitUse,
-    Try,
-    UnaryOp,
-    Unset,
-    UseDeclaration,
-    UseDeclarations,
-    Variable,
-    While,
-    Yield,
-)
+try:
+    from phply.phpast import *  # noqa: F403
+except ImportError:
+    from bashe.types import *  # noqa: F403
 
 from bashe.parser import Bashe
 
@@ -1422,7 +1345,7 @@ def test_empty_expr():
 
 
 def test_eval_expr():
-    input = "<?php eval(\"echo 1;\");"
+    input = '<?php eval("echo 1;");'
     expected = [Eval("echo 1;")]
     eq_ast(input, expected)
 
@@ -1436,10 +1359,12 @@ def test_silence():
 def test_static_variables():
     input = "<?php static $x = 1, $y;"
     expected = [
-        Static([
-            StaticVariable("$x", 1),
-            StaticVariable("$y", None),
-        ])
+        Static(
+            [
+                StaticVariable("$x", 1),
+                StaticVariable("$y", None),
+            ]
+        )
     ]
     eq_ast(input, expected)
 

@@ -11,9 +11,14 @@ class _PhpAstProxy:
     @staticmethod
     def _load():
         if _PhpAstProxy._module is None:
-            from phply import phpast as mod
+            try:
+                from phply import phpast as mod
 
-            _PhpAstProxy._module = mod
+                _PhpAstProxy._module = mod
+            except ImportError:
+                from . import types as mod
+
+                _PhpAstProxy._module = mod
         return _PhpAstProxy._module
 
     def __getattr__(self, name):

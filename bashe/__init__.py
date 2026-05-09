@@ -1,3 +1,3 @@
-from .parser import Bashe
+from .parser import Bashe, php
 
-__all__ = ["Bashe"]
+__all__ = ["Bashe", "php"]
