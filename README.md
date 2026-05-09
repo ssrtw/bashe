@@ -1,17 +1,25 @@
 # Bashe
 
+<p align="center">
+  <img src="assets/logo.png" alt="Bashe logo" width="256">
+</p>
+
 [![GitHub release](https://img.shields.io/github/release/ssrtw/bashe/all.svg)](https://github.com/ssrtw/bashe/releases)
 [![license](https://img.shields.io/github/license/ssrtw/bashe.svg)](./LICENSE)
 ![python version badge](https://img.shields.io/badge/language-python3.10-orange.svg)
 
-Bashe (巴蛇) is a fast, tree-sitter based PHP parser for Python, with
-optional phply-compatible AST output.
+Bashe (巴蛇, pronounced like "parser") is a fast, tree-sitter based PHP
+parser for Python, with optional phply-compatible AST output. The name
+comes from the legendary giant snake in Chinese mythology.
 
 ## Features
 
 - Parses PHP source into a structured AST using tree-sitter
+- Supports PHP 7 features: scalar types, return type declarations,
+  null coalescing (`??`), spaceship operator (`<=>`)
+- Supports PHP 8 features: constructor property promotion, named
+  arguments, nullsafe operator (`?->`), match expressions, union types
 - Optional `phply.phpparse`-compatible output — just `pip install bashe[phply]`
-- Supports inline HTML, heredoc/nowdoc, closures, traits, named arguments, and more
 - Minimal dependencies when phply is not needed
 
 ## Installation
@@ -66,7 +74,7 @@ equivalent inputs.
 | bashe  | 2.46s      | 1.00×        | 1.73s      | 1.00×        |
 | phply  | 5.76s      | 2.34×        | 3.66s      | 2.12×        |
 
-_Benchmark: parsing `bench.php` (multi-line PHP with includes, evals,
+\_Benchmark: parsing `bench.php` (multi-line PHP with includes, evals,
 function definitions) 10,000 times on CPython 3.10 and 3.13
 
 ## Development
