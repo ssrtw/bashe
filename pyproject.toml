@@ -19,5 +19,10 @@ dev = [
   "pytest>=7",
 ]
 
+[tool.pytest]
+filterwarnings = [
+  "ignore::DeprecationWarning:bashe.parser",
+]
+
 [tool.setuptools.packages.find]
 exclude = ["assets"]

@@ -132,7 +132,7 @@ $result = 1 <=> 2;
 
 
 def test_php8_constructor_promotion():
-    """Constructor property promotion — parameters with visibility."""
+    """Constructor property promotion - parameters with visibility."""
     input = """<?php
 class User {
     public function __construct(
@@ -166,7 +166,7 @@ class User {
 
 
 def test_php8_named_arguments():
-    """Named arguments — name: value syntax in calls."""
+    """Named arguments - name: value syntax in calls."""
     input = """<?php
 $user = new User(age: 25, name: "Alice");
 """
@@ -200,7 +200,7 @@ $city = $user?->address?->getCity();
 
 
 def test_php8_match_expression():
-    """Match expression (PHP 8.0) — expression-based pattern matching."""
+    """Match expression (PHP 8.0) - expression-based pattern matching."""
     input = """<?php
 echo match($user->name) {
     'Alice' => '管理者',
@@ -254,7 +254,7 @@ class User {
 
 
 def test_php81_intersection_type():
-    """Intersection type hints — Countable&Iterator (PHP 8.1)."""
+    """Intersection type hints - Countable&Iterator (PHP 8.1)."""
     input = """<?php
 function process(Countable&Iterator $input): void {}
 """
@@ -278,7 +278,7 @@ function process(Countable&Iterator $input): void {}
 
 
 def test_php82_readonly_class():
-    """Readonly class — all properties implicitly readonly (PHP 8.2)."""
+    """Readonly class - all properties implicitly readonly (PHP 8.2)."""
     input = """<?php
 readonly class Config {
     public string $host;
@@ -303,7 +303,7 @@ readonly class Config {
 
 
 def test_php82_dnf_type():
-    """DNF (Disjunctive Normal Form) type — (A&B)|C (PHP 8.2)."""
+    """DNF (Disjunctive Normal Form) type - (A&B)|C (PHP 8.2)."""
     input = """<?php
 function handle((Countable&Iterator)|null $data): void {}
 """
@@ -311,9 +311,7 @@ function handle((Countable&Iterator)|null $data): void {}
         Function(
             "handle",
             [
-                FormalParameter(
-                    "$data", None, False, "(Countable&Iterator)|null"
-                ),
+                FormalParameter("$data", None, False, "(Countable&Iterator)|null"),
             ],
             [],
             False,

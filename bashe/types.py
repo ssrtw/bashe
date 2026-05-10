@@ -1,10 +1,12 @@
 """Native phply-compatible AST node types.
 
 All 79 node types matching phply.phpast definitions are provided as
-native Python classes.  No dependency on phply is required — these can
+native Python classes.  No dependency on phply is required - these can
 be extended with new fields or entirely new node types for PHP syntax
 that phply does not support.
 """
+
+from typing import Any
 
 __all__ = [
     "InlineHTML",
@@ -108,7 +110,7 @@ class Node:
 
     fields = []
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         assert len(self.fields) == len(args), (
             f"{self.__class__.__name__} takes {len(self.fields)} arguments"
         )
@@ -116,11 +118,11 @@ class Node:
         for i, field in enumerate(self.fields):
             setattr(self, field, args[i])
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         vals = ", ".join(repr(getattr(self, f, None)) for f in self.fields)
         return f"{self.__class__.__name__}({vals})"
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, self.__class__):
             return False
         for field in self.fields:
@@ -128,11 +130,15 @@ class Node:
                 return False
         return True
 
-    def __ne__(self, other):
+    def __ne__(self, other: object) -> bool:
         return not self.__eq__(other)
 
-    def accept(self, visitor):
-        """Call *visitor* on this node and every child node depth-first."""
+    def accept(self, visitor: Any) -> None:
+        """Call *visitor* on this node and every child node depth-first.
+
+        Args:
+            visitor: A callable that receives each node in the subtree.
+        """
         visitor(self)
         for field in self.fields:
             value = getattr(self, field)
@@ -143,10 +149,18 @@ class Node:
                     if isinstance(item, Node):
                         item.accept(visitor)
 
-    def generic(self, with_lineno=False):
+    def generic(self, with_lineno: bool = False) -> tuple[str, dict[str, Any]]:
         """Return a ``(classname, dict)`` tuple for nested serialisation.
 
         Matches the phply ``generic()`` protocol.
+
+        Args:
+            with_lineno (bool): If True, include ``lineno`` in the
+                serialised dictionary.
+
+        Returns:
+            A ``(str, dict)`` tuple where the string is the class name
+            and the dict maps field names to serialised values.
         """
         values = {}
         if with_lineno:
@@ -166,8 +180,18 @@ class Node:
         return (self.__class__.__name__, values)
 
 
-def _node(name, fields):
-    """Create a concrete Node subclass with the given *fields*."""
+def _node(name: str, fields: list[str]) -> type[Node]:
+    """Create a concrete Node subclass with the given *fields*.
+
+    Args:
+        name (str): The class name for the new node type.
+        fields (list[str]): Ordered list of field names that will be
+            set as positional constructor arguments.
+
+    Returns:
+        A new subclass of :class:`Node` with the given ``name`` and
+        ``fields`` class attribute.
+    """
     return type(name, (Node,), {"fields": list(fields)})
 
 

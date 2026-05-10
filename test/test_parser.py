@@ -1,7 +1,8 @@
+# ruff: noqa: F403, F405
 try:
-    from phply.phpast import *  # noqa: F403
+    from phply.phpast import *
 except ImportError:
-    from bashe.types import *  # noqa: F403
+    from bashe.types import *
 
 from bashe.utils import F
 from test.util import eq_ast
@@ -834,9 +835,9 @@ def test_closures():
                             Parameter(Variable("$name"), False),
                         ],
                     )
-            ],
-            False,
-        ),
+                ],
+                False,
+            ),
             False,
         ),
         FunctionCall(Variable("$greet"), [Parameter("World", False)]),
@@ -880,7 +881,8 @@ def test_magic_constants():
     ?>"""
     expected = [
         Namespace("Shmamespace", []),
-        F(Function,
+        F(
+            Function,
             "p",
             [FormalParameter("$x", None, False, None)],
             [
@@ -974,7 +976,8 @@ def test_type_hinting():
     }
     ?>"""
     expected = [
-        F(Function,
+        F(
+            Function,
             "foo",
             [
                 FormalParameter("$var1", None, False, "Foo"),
@@ -1207,7 +1210,8 @@ def test_result_multiple_offsets():
 def test_yield():
     input = """<? function f() { yield; yield 1; }"""
     expected = [
-        F(Function,
+        F(
+            Function,
             "f",
             [],
             [

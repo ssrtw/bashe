@@ -1,4 +1,4 @@
-"""Tests for bashe.types.Node — accept() and generic()."""
+"""Tests for bashe.types.Node - accept() and generic()."""
 
 from bashe.types import (
     Array,

@@ -1,11 +1,14 @@
 """Tree-sitter PHP parser - refactored with dispatch table."""
 
+from __future__ import annotations
+
 import logging
 import os
 import warnings
+from typing import Any, Callable
 
 import tree_sitter_php as tsphp
-from tree_sitter import Language, Parser
+from tree_sitter import Language, Node, Parser
 
 from .utils import F
 
@@ -24,7 +27,17 @@ class _PhpAstProxy:
     _warned_legacy = False
 
     @classmethod
-    def configure(cls, legacy=False):
+    def configure(cls, legacy: bool = False) -> None:
+        """Switch the AST backend between native and legacy modes.
+
+        Args:
+            legacy (bool): If True, load :mod:`phply.phpast`. If
+                False (the default), use native :mod:`bashe.types`.
+
+        Raises:
+            ImportError: When ``legacy=True`` but phply is not
+                installed.
+        """
         cls._legacy = legacy
         if legacy:
             try:
@@ -40,7 +53,7 @@ class _PhpAstProxy:
 
             cls._module = mod
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         if self._module is None:
             self.configure(legacy=False)
 
@@ -104,7 +117,19 @@ STRING_EXCLUDED = {
 }
 
 
-def parse_number(text):
+def parse_number(text: str) -> int | float:
+    """Parse a PHP numeric literal string to an int or float.
+
+    Handles hex (``0x``), binary (``0b``), octal (``0o`` / ``0``
+    prefix), decimal integer, and float literals, stripping
+    underscores.
+
+    Args:
+        text (str): The raw source text of the numeric literal.
+
+    Returns:
+        int | float: The parsed numeric value.
+    """
     text = text.lower().replace("_", "")
     if text.startswith("0x"):
         return int(text, 16)
@@ -123,7 +148,19 @@ def parse_number(text):
         return float(text)
 
 
-def unescape_string(text, is_double):
+def unescape_string(text: str, is_double: bool) -> str:
+    """Resolve PHP escape sequences in a string literal.
+
+    Args:
+        text (str): The raw source text between quotes.
+        is_double (bool): True for double-quoted / heredoc strings
+            (supports ``\\n``, ``\\xNN``, octal, etc.), False for
+            single-quoted / nowdoc strings (only handles ``\\\\`` and
+            ``\\'``).
+
+    Returns:
+        str: The unescaped string value.
+    """
     if not is_double:
         res, i = [], 0
         while i < len(text):
@@ -185,7 +222,7 @@ def unescape_string(text, is_double):
 # ─── context ──────────────────────────────────────────────────────────
 
 
-def _scope_text(scope_node, ctx):
+def _scope_text(scope_node: Node | None, ctx: Ctx) -> str:
     if scope_node is None:
         return ""
     if scope_node.type == "variable_name":
@@ -197,6 +234,19 @@ def _scope_text(scope_node, ctx):
 
 
 class Ctx:
+    """Parse context holding state used during tree-sitter translation.
+
+    Tracks the current filename, namespace, class, method, trait, and
+    provides helpers for extracting source text, computing line numbers,
+    processing string interpolation, and dispatching child nodes through
+    the main :func:`translate` loop.
+
+    Args:
+        source (bytes): The UTF-8 encoded source code being parsed.
+        filename (str | None): Optional filename for ``__FILE__`` and
+            ``__DIR__`` resolution.
+    """
+
     __slots__ = (
         "source",
         "echo_mode",
@@ -210,7 +260,7 @@ class Ctx:
         "trait",
     )
 
-    def __init__(self, source: bytes, filename: str = None):
+    def __init__(self, source: bytes, filename: str | None = None):
         self.source = source
         self.echo_mode = False
         self.string_mode = False
@@ -222,16 +272,18 @@ class Ctx:
         self.method = None
         self.trait = None
 
-    def text(self, n):
+    def text(self, n: Node | None) -> str:
         return self.source[n.start_byte : n.end_byte].decode("utf8") if n else ""
 
-    def lineno(self, n):
+    def lineno(self, n: Node | None) -> dict[str, int]:
         return {"lineno": n.start_point[0] + 1} if n else {}
 
-    def translate(self, n):
+    def translate(self, n: Node) -> Any | list[Any] | None:
         return translate(n, self)
 
-    def add_text_gap(self, parts, child, prev_end, is_double):
+    def add_text_gap(
+        self, parts: list[Any], child: Node, prev_end: int | None, is_double: bool
+    ) -> int:
         start = prev_end if prev_end is not None else child.start_byte
         txt = unescape_string(
             self.source[start : child.end_byte].decode("utf8"), is_double
@@ -243,7 +295,9 @@ class Ctx:
         return child.end_byte
 
     # string body helpers ───────────────────────────────────────
-    def process_string_children(self, children, parts, is_double):
+    def process_string_children(
+        self, children: list[Node], parts: list[Any], is_double: bool
+    ) -> None:
         i = 0
         prev_end = None
         while i < len(children):
@@ -276,7 +330,7 @@ class Ctx:
                 prev_end = c.end_byte
             i += 1
 
-    def build_string_result(self, parts, ts_node):
+    def build_string_result(self, parts: list[Any], ts_node: Node) -> Any:
         if not parts:
             return ""
         if len(parts) == 1 and isinstance(parts[0], (str, int, float)):
@@ -289,7 +343,7 @@ class Ctx:
         return res
 
     # echo helper ───────────────────────────────────────────────
-    def emit(self, nodes, child, result):
+    def emit(self, nodes: list[Any], child: Node, result: Any) -> None:
         if self.echo_mode:
             nodes.append(php.Echo([result], **self.lineno(child)))
             self.echo_mode = False
@@ -304,8 +358,8 @@ class Ctx:
 _HANDLERS = {}
 
 
-def _handler(*types):
-    def dec(fn):
+def _handler(*types: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def dec(fn: Callable[..., Any]) -> Callable[..., Any]:
         for t in types:
             _HANDLERS[t] = fn
         return fn
@@ -317,7 +371,7 @@ def _handler(*types):
 
 
 @_handler("program", "namespace_definition", "declaration_list")
-def top_level(ts_node, ctx):
+def top_level(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     old_ns = ctx.ns
     name = None
     if ts_node.type == "namespace_definition":
@@ -402,9 +456,7 @@ def top_level(ts_node, ctx):
         if len(nodes) == 1 and isinstance(nodes[0], php.Block):
             nodes = nodes[0].nodes
         result = php.Namespace(name, nodes, **ctx.lineno(ts_node))
-        has_body = any(
-            c.type == "declaration_list" for c in ts_node.children
-        )
+        has_body = any(c.type == "declaration_list" for c in ts_node.children)
         if has_body:
             ctx.ns = old_ns
         return result
@@ -415,7 +467,7 @@ def top_level(ts_node, ctx):
 
 
 @_handler("anonymous_function")
-def anonymous_function(ts_node, ctx):
+def anonymous_function(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     params = []
     uses = []
     is_ref = False
@@ -450,23 +502,23 @@ def anonymous_function(ts_node, ctx):
 
 
 @_handler("variable_name")
-def variable_name(ts_node, ctx):
+def variable_name(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return php.Variable(ctx.text(ts_node), **ctx.lineno(ts_node))
 
 
 @_handler("variable_variable")
-def variable_variable(ts_node, ctx):
+def variable_variable(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     inner = ctx.translate(ts_node.named_children[0])
     return php.Variable(inner, **ctx.lineno(ts_node))
 
 
 @_handler("integer")
-def integer(ts_node, ctx):
+def integer(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return parse_number(ctx.text(ts_node))
 
 
 @_handler("float")
-def float_(ts_node, ctx):
+def float_(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return float(ctx.text(ts_node))
 
 
@@ -483,7 +535,7 @@ MAGIC_CONSTANTS = {
 
 
 @_handler("name", "qualified_name", "fully_qualified_name", "relative_name")
-def name(ts_node, ctx):
+def name(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     txt = ctx.text(ts_node)
     if txt.lower() in ("static", "self", "parent"):
         return txt.lower()
@@ -510,7 +562,7 @@ def name(ts_node, ctx):
 
 
 @_handler("array_creation_expression")
-def array_creation(ts_node, ctx):
+def array_creation(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     elements = []
     for c in ts_node.children:
         if c.type == "array_element_initializer":
@@ -532,12 +584,12 @@ def array_creation(ts_node, ctx):
 
 
 @_handler("list_literal")
-def list_literal(ts_node, ctx):
+def list_literal(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return [ctx.translate(c) for c in ts_node.named_children]
 
 
 @_handler("string", "encapsed_string", "heredoc", "nowdoc", "shell_command_expression")
-def string(ts_node, ctx):
+def string(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     is_double = ts_node.type != "nowdoc" and (
         ts_node.type != "string" or '"' in ctx.text(ts_node).splitlines()[0]
     )
@@ -555,7 +607,7 @@ def string(ts_node, ctx):
 
 
 @_handler("text_interpolation")
-def text_interpolation(ts_node, ctx):
+def text_interpolation(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     txt = ctx.text(ts_node)
     idx = txt.find("?>")
     if idx >= 0:
@@ -572,7 +624,7 @@ def text_interpolation(ts_node, ctx):
 
 
 @_handler("expression_statement")
-def expression_statement(ts_node, ctx):
+def expression_statement(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     if not ts_node.named_children:
         return None
     res = ctx.translate(ts_node.named_children[0])
@@ -582,50 +634,50 @@ def expression_statement(ts_node, ctx):
 
 
 @_handler("clone_expression")
-def clone_expr(ts_node, ctx):
+def clone_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     return php.Clone(ctx.translate(nc[0]) if nc else None, **ctx.lineno(ts_node))
 
 
 @_handler("print_intrinsic")
-def print_intrinsic(ts_node, ctx):
+def print_intrinsic(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     return php.Print(ctx.translate(nc[0]) if nc else None, **ctx.lineno(ts_node))
 
 
 @_handler("break_statement")
-def break_stmt(ts_node, ctx):
+def break_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     depth = ctx.translate(nc[0]) if nc else None
     return php.Break(depth, **ctx.lineno(ts_node))
 
 
 @_handler("continue_statement")
-def continue_stmt(ts_node, ctx):
+def continue_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     depth = ctx.translate(nc[0]) if nc else None
     return php.Continue(depth, **ctx.lineno(ts_node))
 
 
 @_handler("unset_statement")
-def unset_stmt(ts_node, ctx):
+def unset_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     vars_ = [ctx.translate(c) for c in ts_node.named_children]
     return php.Unset(vars_, **ctx.lineno(ts_node))
 
 
 @_handler("parenthesized_expression")
-def parenthesized(ts_node, ctx):
+def parenthesized(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return ctx.translate(ts_node.named_children[0])
 
 
 @_handler("error_suppression_expression")
-def error_suppression(ts_node, ctx):
+def error_suppression(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     return php.Silence(ctx.translate(nc[0]) if nc else None, **ctx.lineno(ts_node))
 
 
 @_handler("while_statement")
-def while_stmt(ts_node, ctx):
+def while_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     cond = ctx.translate(nc[0]) if nc else None
     body = ctx.translate(nc[1]) if len(nc) > 1 else php.Block([], **ctx.lineno(ts_node))
@@ -634,7 +686,7 @@ def while_stmt(ts_node, ctx):
 
 
 @_handler("do_statement")
-def do_stmt(ts_node, ctx):
+def do_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     body = ctx.translate(nc[0]) if nc else php.Block([], **ctx.lineno(ts_node))
     body_stmts = body.nodes if isinstance(body, php.Block) else [body]
@@ -643,19 +695,21 @@ def do_stmt(ts_node, ctx):
 
 
 @_handler("for_statement")
-def for_stmt(ts_node, ctx):
+def for_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     start = ctx.translate(nc[0]) if len(nc) > 0 else None
     test = ctx.translate(nc[1]) if len(nc) > 1 else None
     count = ctx.translate(nc[2]) if len(nc) > 2 else None
     body_node = nc[3] if len(nc) > 3 else None
-    body = ctx.translate(body_node) if body_node else php.Block([], **ctx.lineno(ts_node))
+    body = (
+        ctx.translate(body_node) if body_node else php.Block([], **ctx.lineno(ts_node))
+    )
     body_stmts = body.nodes if isinstance(body, php.Block) else [body]
     return php.For(start, test, count, php.Block(body_stmts), **ctx.lineno(ts_node))
 
 
 @_handler("switch_statement")
-def switch_stmt(ts_node, ctx):
+def switch_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     expr = ctx.translate(nc[0]) if nc else None
     switch_block = nc[1] if len(nc) > 1 else None
@@ -664,7 +718,7 @@ def switch_stmt(ts_node, ctx):
 
 
 @_handler("switch_block", "case_statement", "default_statement")
-def switch_block(ts_node, ctx):
+def switch_block(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     if ts_node.type == "switch_block":
         result = []
         for c in ts_node.named_children:
@@ -690,19 +744,19 @@ def switch_block(ts_node, ctx):
 
 
 @_handler("match_expression")
-def match_expr(ts_node, ctx):
+def match_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     cond = ctx.translate(ts_node.child_by_field_name("condition"))
     body = ctx.translate(ts_node.child_by_field_name("body"))
     return php.MatchExpr(cond, body or [], **ctx.lineno(ts_node))
 
 
 @_handler("match_block")
-def match_block_handler(ts_node, ctx):
+def match_block_handler(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return [ctx.translate(c) for c in ts_node.named_children]
 
 
 @_handler("match_conditional_expression")
-def match_conditional(ts_node, ctx):
+def match_conditional(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     cond_n = ts_node.child_by_field_name("conditional_expressions")
     if cond_n is not None:
         patterns = [ctx.translate(c) for c in cond_n.named_children]
@@ -717,13 +771,13 @@ def match_conditional(ts_node, ctx):
 
 
 @_handler("match_default_expression")
-def match_default_handler(ts_node, ctx):
+def match_default_handler(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     body = ctx.translate(ts_node.child_by_field_name("return_expression"))
     return php.MatchArm(None, body, **ctx.lineno(ts_node))
 
 
 @_handler("interface_declaration")
-def interface_decl(ts_node, ctx):
+def interface_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     name = ctx.text(ts_node.child_by_field_name("name"))
     extends = None
     for c in ts_node.named_children:
@@ -747,7 +801,7 @@ def interface_decl(ts_node, ctx):
 
 
 @_handler("function_static_declaration")
-def function_static_decl(ts_node, ctx):
+def function_static_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     vars_ = []
     for c in ts_node.named_children:
         name_node = c.child_by_field_name("name")
@@ -760,13 +814,13 @@ def function_static_decl(ts_node, ctx):
 
 
 @_handler("return_statement")
-def return_stmt(ts_node, ctx):
+def return_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     expr = ctx.translate(ts_node.named_children[0]) if ts_node.named_children else None
     return php.Return(expr, **ctx.lineno(ts_node))
 
 
 @_handler("exit_statement")
-def exit_stmt(ts_node, ctx):
+def exit_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     arg = None
     for c in ts_node.named_children:
         r = ctx.translate(c)
@@ -783,7 +837,7 @@ def exit_stmt(ts_node, ctx):
     "require_expression",
     "require_once_expression",
 )
-def include_expr(ts_node, ctx):
+def include_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nc = ts_node.named_children
     expr = ctx.translate(nc[0]) if nc else None
     t = ts_node.type
@@ -795,7 +849,7 @@ def include_expr(ts_node, ctx):
 
 
 @_handler("global_statement", "global_declaration")
-def global_stmt(ts_node, ctx):
+def global_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     vars_ = [
         ctx.translate(c)
         for c in ts_node.named_children
@@ -805,7 +859,7 @@ def global_stmt(ts_node, ctx):
 
 
 @_handler("const_declaration")
-def const_decl(ts_node, ctx):
+def const_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     consts = []
     for c in ts_node.named_children:
         if c.type == "const_element":
@@ -817,7 +871,7 @@ def const_decl(ts_node, ctx):
 
 
 @_handler("declare_statement")
-def declare_stmt(ts_node, ctx):
+def declare_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     directives = []
     body_nodes = []
     for c in ts_node.named_children:
@@ -850,7 +904,7 @@ def declare_stmt(ts_node, ctx):
 
 
 @_handler("namespace_use_declaration")
-def namespace_use_decl(ts_node, ctx):
+def namespace_use_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     decls = []
     for c in ts_node.children:
         if c.type == "namespace_use_clause":
@@ -859,7 +913,7 @@ def namespace_use_decl(ts_node, ctx):
 
 
 @_handler("use_declaration")
-def trait_use_decl(ts_node, ctx):
+def trait_use_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     name = ""
     modifiers = []
     for c in ts_node.named_children:
@@ -873,7 +927,7 @@ def trait_use_decl(ts_node, ctx):
 
 
 @_handler("use_as_clause")
-def use_as_clause(ts_node, ctx):
+def use_as_clause(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     named = ts_node.named_children
     original = ctx.translate(named[0]) if len(named) > 0 else None
     alias = None
@@ -889,14 +943,14 @@ def use_as_clause(ts_node, ctx):
 
 
 @_handler("use_list")
-def use_list(ts_node, ctx):
+def use_list(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return [
         ctx.translate(c) for c in ts_node.named_children if c.type == "use_as_clause"
     ]
 
 
 @_handler("namespace_use_clause")
-def namespace_use_clause(ts_node, ctx):
+def namespace_use_clause(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     named = ts_node.named_children
     name = ctx.text(named[0]) if named else ""
     alias_node = ts_node.child_by_field_name("alias")
@@ -908,7 +962,7 @@ def namespace_use_clause(ts_node, ctx):
 
 
 @_handler("assignment_expression", "augmented_assignment_expression")
-def assignment(ts_node, ctx):
+def assignment(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     left_node = ts_node.child_by_field_name("left")
     left = ctx.translate(left_node)
     right = ctx.translate(ts_node.child_by_field_name("right"))
@@ -930,7 +984,7 @@ def assignment(ts_node, ctx):
 
 
 @_handler("reference_assignment_expression")
-def reference_assignment(ts_node, ctx):
+def reference_assignment(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     named = ts_node.named_children
     left = ctx.translate(named[0]) if named else None
     right = ctx.translate(named[1]) if len(named) > 1 else None
@@ -938,7 +992,7 @@ def reference_assignment(ts_node, ctx):
 
 
 @_handler("update_expression")
-def update_expr(ts_node, ctx):
+def update_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     op_text = ""
     for c in ts_node.children:
         if not c.is_named:
@@ -951,7 +1005,7 @@ def update_expr(ts_node, ctx):
 
 
 @_handler("unary_op_expression")
-def unary(ts_node, ctx):
+def unary(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     op = ctx.text(ts_node.children[0]).strip()
     return php.UnaryOp(
         op, ctx.translate(ts_node.named_children[0]), **ctx.lineno(ts_node)
@@ -959,7 +1013,7 @@ def unary(ts_node, ctx):
 
 
 @_handler("binary_expression")
-def binary(ts_node, ctx):
+def binary(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     left = ctx.translate(ts_node.child_by_field_name("left"))
     right = ctx.translate(ts_node.child_by_field_name("right"))
     op = "".join(
@@ -974,7 +1028,7 @@ def binary(ts_node, ctx):
 
 
 @_handler("conditional_expression")
-def conditional(ts_node, ctx):
+def conditional(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     cond = ctx.translate(ts_node.child_by_field_name("condition"))
     body = ctx.translate(ts_node.child_by_field_name("body"))
     alt = ctx.translate(ts_node.child_by_field_name("alternative"))
@@ -984,7 +1038,7 @@ def conditional(ts_node, ctx):
 
 
 @_handler("cast_expression")
-def cast_expr(ts_node, ctx):
+def cast_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     type_name = ""
     for c in ts_node.children:
         if c.type == "cast_type":
@@ -1000,7 +1054,7 @@ def cast_expr(ts_node, ctx):
 # ─── 5.5. Dynamic Variable Names ──────────────────────────────────────
 
 
-def _dv_translate(node, ctx):
+def _dv_translate(node: Node, ctx: Ctx) -> Any | list[Any] | None:
     """Translate inside dynamic_variable_name context."""
     if node.type == "name":
         return php.Variable("$" + ctx.text(node), **ctx.lineno(node))
@@ -1054,7 +1108,7 @@ def _dv_translate(node, ctx):
 
 
 @_handler("dynamic_variable_name")
-def dynamic_variable_name(ts_node, ctx):
+def dynamic_variable_name(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     inner = ts_node.named_children[0] if ts_node.named_children else None
     if inner is None:
         return None
@@ -1078,7 +1132,7 @@ def dynamic_variable_name(ts_node, ctx):
 
 
 @_handler("member_access_expression")
-def member_access(ts_node, ctx):
+def member_access(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     obj = ctx.translate(ts_node.child_by_field_name("object"))
     name_n = ts_node.child_by_field_name("name")
     name = (
@@ -1092,7 +1146,7 @@ def member_access(ts_node, ctx):
 
 
 @_handler("subscript_expression")
-def subscript(ts_node, ctx):
+def subscript(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     obj_node = ts_node.named_children[0]
     obj = ctx.translate(obj_node)
     idx = (
@@ -1115,7 +1169,7 @@ def subscript(ts_node, ctx):
 
 
 @_handler("scoped_property_access_expression")
-def scoped_property(ts_node, ctx):
+def scoped_property(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     scope_n = ts_node.child_by_field_name("scope")
     scope = _scope_text(scope_n, ctx)
     name_n = ts_node.child_by_field_name("name")
@@ -1127,7 +1181,7 @@ def scoped_property(ts_node, ctx):
 
 
 @_handler("class_constant_access_expression")
-def class_constant_access(ts_node, ctx):
+def class_constant_access(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     named = ts_node.named_children
     scope_n = named[0] if len(named) > 0 else None
     scope = _scope_text(scope_n, ctx)
@@ -1146,7 +1200,7 @@ def class_constant_access(ts_node, ctx):
 
 
 @_handler("function_call_expression")
-def function_call(ts_node, ctx):
+def function_call(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     fn_node = ts_node.child_by_field_name("function")
     fn_val = ctx.translate(fn_node)
     args_node = ts_node.child_by_field_name("arguments")
@@ -1172,7 +1226,7 @@ def function_call(ts_node, ctx):
 
 
 @_handler("scoped_call_expression")
-def scoped_call(ts_node, ctx):
+def scoped_call(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     scope_n = ts_node.child_by_field_name("scope")
     scope = _scope_text(scope_n, ctx)
     name_n = ts_node.child_by_field_name("name")
@@ -1186,7 +1240,7 @@ def scoped_call(ts_node, ctx):
 
 
 @_handler("member_call_expression")
-def member_call(ts_node, ctx):
+def member_call(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     obj = ctx.translate(ts_node.child_by_field_name("object"))
     name_n = ts_node.child_by_field_name("name")
     name = (
@@ -1204,7 +1258,7 @@ def member_call(ts_node, ctx):
 
 
 @_handler("nullsafe_member_access_expression")
-def nullsafe_access(ts_node, ctx):
+def nullsafe_access(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     obj = ctx.translate(ts_node.child_by_field_name("object"))
     name_n = ts_node.child_by_field_name("name")
     name = (
@@ -1218,7 +1272,7 @@ def nullsafe_access(ts_node, ctx):
 
 
 @_handler("nullsafe_member_call_expression")
-def nullsafe_call(ts_node, ctx):
+def nullsafe_call(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     obj = ctx.translate(ts_node.child_by_field_name("object"))
     name_n = ts_node.child_by_field_name("name")
     name = ctx.text(name_n) if name_n else ""
@@ -1230,7 +1284,7 @@ def nullsafe_call(ts_node, ctx):
 
 
 @_handler("object_creation_expression")
-def new(ts_node, ctx):
+def new(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     cls_node = None
     args_node = None
     for c in ts_node.children:
@@ -1244,13 +1298,11 @@ def new(ts_node, ctx):
 
 
 @_handler("argument")
-def argument(ts_node, ctx):
+def argument(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     name_node = ts_node.child_by_field_name("name")
     if name_node:
         value = ctx.translate(ts_node.named_children[-1])
-        return php.NamedArgument(
-            ctx.text(name_node), value, **ctx.lineno(ts_node)
-        )
+        return php.NamedArgument(ctx.text(name_node), value, **ctx.lineno(ts_node))
     return php.Parameter(
         ctx.translate(ts_node.named_children[-1]),
         "&" in ctx.text(ts_node),
@@ -1262,7 +1314,7 @@ def argument(ts_node, ctx):
 
 
 @_handler("yield_expression")
-def yield_expr(ts_node, ctx):
+def yield_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     expr = None
     for c in ts_node.named_children:
         if c.type == "yield":
@@ -1275,24 +1327,24 @@ def yield_expr(ts_node, ctx):
 
 
 @_handler("array_element_initializer")
-def array_element_init(ts_node, ctx):
+def array_element_init(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     return ctx.translate(ts_node.named_children[-1])
 
 
 @_handler("throw_expression")
-def throw_expr(ts_node, ctx):
+def throw_expr(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     expr = ctx.translate(ts_node.named_children[0]) if ts_node.named_children else None
     return php.Throw(expr, **ctx.lineno(ts_node))
 
 
 @_handler("echo_statement", "echo_stdout")
-def echo(ts_node, ctx):
+def echo(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     items = [ctx.translate(c) for c in ts_node.named_children if c.type != "echo"]
     return php.Echo(items, **ctx.lineno(ts_node))
 
 
 @_handler("if_statement")
-def if_stmt(ts_node, ctx):
+def if_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     cond = ctx.translate(ts_node.child_by_field_name("condition"))
     body = ctx.translate(ts_node.child_by_field_name("body"))
     elseifs = []
@@ -1326,7 +1378,7 @@ def if_stmt(ts_node, ctx):
 
 
 @_handler("foreach_statement")
-def foreach_stmt(ts_node, ctx):
+def foreach_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     named = ts_node.named_children
     arr = ctx.translate(named[0])
     key = None
@@ -1357,7 +1409,7 @@ def foreach_stmt(ts_node, ctx):
 
 
 @_handler("compound_statement")
-def compound(ts_node, ctx):
+def compound(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nodes = []
     for c in ts_node.children:
         if c.type not in ("{", "}"):
@@ -1371,7 +1423,7 @@ def compound(ts_node, ctx):
 
 
 @_handler("colon_block")
-def colon_block(ts_node, ctx):
+def colon_block(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     nodes = []
     for c in ts_node.named_children:
         res = ctx.translate(c)
@@ -1387,7 +1439,7 @@ def colon_block(ts_node, ctx):
 
 
 @_handler("property_declaration")
-def property_decl(ts_node, ctx):
+def property_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     modifiers = []
     elements = []
     for c in ts_node.children:
@@ -1407,7 +1459,7 @@ def property_decl(ts_node, ctx):
 
 
 @_handler("method_declaration")
-def method_decl(ts_node, ctx):
+def method_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     old_method = ctx.method
     old_fn = ctx.fn
     modifiers = []
@@ -1430,14 +1482,16 @@ def method_decl(ts_node, ctx):
     ]
     body = ctx.translate(ts_node.child_by_field_name("body"))
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
-    result = php.Method(name, modifiers, params, body_stmts, False, **ctx.lineno(ts_node))
+    result = php.Method(
+        name, modifiers, params, body_stmts, False, **ctx.lineno(ts_node)
+    )
     ctx.method = old_method
     ctx.fn = old_fn
     return result
 
 
 @_handler("class_declaration")
-def class_decl(ts_node, ctx):
+def class_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     old_cls = ctx.cls
     name = ctx.text(ts_node.child_by_field_name("name"))
     ctx.cls = f"{ctx.ns}\\{name}" if ctx.ns else name
@@ -1499,7 +1553,7 @@ def class_decl(ts_node, ctx):
 
 
 @_handler("trait_declaration")
-def trait_decl(ts_node, ctx):
+def trait_decl(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     old_trait = ctx.trait
     old_cls = ctx.cls
     name = ctx.text(ts_node.child_by_field_name("name"))
@@ -1531,7 +1585,7 @@ def trait_decl(ts_node, ctx):
 
 
 @_handler("function_definition")
-def function_def(ts_node, ctx):
+def function_def(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     old_fn = ctx.fn
     name = ctx.text(ts_node.child_by_field_name("name"))
     ctx.fn = f"{ctx.ns}\\{name}" if ctx.ns else name
@@ -1543,13 +1597,21 @@ def function_def(ts_node, ctx):
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
     return_type_node = ts_node.child_by_field_name("return_type")
     return_type = ctx.text(return_type_node) if return_type_node else None
-    result = F(php.Function, name, params, body_stmts, False, return_type, **ctx.lineno(ts_node))
+    result = F(
+        php.Function,
+        name,
+        params,
+        body_stmts,
+        False,
+        return_type,
+        **ctx.lineno(ts_node),
+    )
     ctx.fn = old_fn
     return result
 
 
 @_handler("simple_parameter")
-def simple_param(ts_node, ctx):
+def simple_param(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     type_node = ts_node.child_by_field_name("type")
     name_node = ts_node.child_by_field_name("name")
     default_node = ts_node.child_by_field_name("default_value")
@@ -1567,7 +1629,7 @@ def simple_param(ts_node, ctx):
 
 
 @_handler("property_promotion_parameter")
-def property_promotion_param(ts_node, ctx):
+def property_promotion_param(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     modifiers = []
     type_node = ts_node.child_by_field_name("type")
     name_node = ts_node.child_by_field_name("name")
@@ -1584,7 +1646,7 @@ def property_promotion_param(ts_node, ctx):
 
 
 @_handler("try_statement")
-def try_stmt(ts_node, ctx):
+def try_stmt(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     body = ctx.translate(ts_node.child_by_field_name("body")) or []
     if isinstance(body, php.Block):
         body = body.nodes
@@ -1600,7 +1662,7 @@ def try_stmt(ts_node, ctx):
 
 
 @_handler("catch_clause")
-def catch_clause(ts_node, ctx):
+def catch_clause(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     type_name = ctx.text(ts_node.child_by_field_name("type"))
     var = ctx.translate(ts_node.child_by_field_name("name"))
     body = ctx.translate(ts_node.child_by_field_name("body"))
@@ -1609,7 +1671,7 @@ def catch_clause(ts_node, ctx):
 
 
 @_handler("finally_clause")
-def finally_clause(ts_node, ctx):
+def finally_clause(ts_node: Node, ctx: Ctx) -> Any | list[Any] | None:
     body = ctx.translate(ts_node.child_by_field_name("body"))
     body_stmts = body.nodes if isinstance(body, php.Block) else ([body] if body else [])
     return php.Finally(body_stmts, **ctx.lineno(ts_node))
@@ -1618,7 +1680,21 @@ def finally_clause(ts_node, ctx):
 # ─── main translate ───────────────────────────────────────────────────
 
 
-def translate(ts_node, ctx):
+def translate(ts_node: Node | None, ctx: Ctx) -> Any | list[Any] | None:
+    """Translate a tree-sitter CST node into an AST node.
+
+    Dispatches through :data:`_HANDLERS` based on ``ts_node.type``.
+    Unknown node types emit a warning and fall back to recursively
+    translating named children.
+
+    Args:
+        ts_node: A tree-sitter Node from the concrete syntax tree.
+        ctx (Ctx): The current parse context.
+
+    Returns:
+        An AST node (from the active backend), a list of AST nodes,
+        a primitive value, or ``None``.
+    """
     if ts_node is None:
         return None
 
@@ -1647,10 +1723,29 @@ def translate(ts_node, ctx):
 
 
 class Bashe:
-    def __init__(self, legacy=False):
+    """PHP parser backed by tree-sitter.
+
+    Args:
+        legacy (bool): If True, use :mod:`phply.phpast` for AST node
+            types (deprecated).  Defaults to False, which uses native
+            :mod:`bashe.types`.
+    """
+
+    def __init__(self, legacy: bool = False) -> None:
         _PhpAstProxy.configure(legacy=legacy)
 
-    def parse(self, code: str, filename: str = None):
+    def parse(self, code: str, filename: str | None = None) -> list[Any]:
+        """Parse PHP source code into a list of AST nodes.
+
+        Args:
+            code (str): The PHP source code to parse.
+            filename (str | None): Optional filename for resolving
+                ``__FILE__`` and ``__DIR__`` magic constants.
+
+        Returns:
+            list: A list of top-level AST node objects.  Returns an
+            empty list if no nodes are produced.
+        """
         src = bytes(code, "utf8")
         tree = _parser.parse(src)
         ctx = Ctx(src, filename)
