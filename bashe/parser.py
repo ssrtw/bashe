@@ -1,36 +1,68 @@
 """Tree-sitter PHP parser - refactored with dispatch table."""
 
+import logging
 import os
+import warnings
 
 import tree_sitter_php as tsphp
 from tree_sitter import Language, Parser
 
 from .utils import F
 
+logger = logging.getLogger(__name__)
+
 
 class _PhpAstProxy:
-    _module = None
+    """Proxy to the PHP AST module.
 
-    @staticmethod
-    def _load():
-        if _PhpAstProxy._module is None:
+    Defaults to native :mod:`bashe.types`.  Use ``Bashe(legacy=True)`` to
+    switch to ``phply.phpast`` for backwards compatibility.
+    """
+
+    _module = None
+    _legacy = False
+    _warned_legacy = False
+
+    @classmethod
+    def configure(cls, legacy=False):
+        cls._legacy = legacy
+        if legacy:
             try:
                 from phply import phpast as mod  # type: ignore
-
-                _PhpAstProxy._module = mod
             except ImportError:
-                from . import types as mod
+                raise ImportError(
+                    "phply is required for legacy compatibility. "
+                    "Install it with:  pip install phply"
+                )
+            cls._module = mod
+        else:
+            from . import types as mod  # noqa: F811
 
-                _PhpAstProxy._module = mod
-        return _PhpAstProxy._module
+            cls._module = mod
 
     def __getattr__(self, name):
-        try:
-            return getattr(self._load(), name)
-        except AttributeError:
-            from . import types
+        if self._module is None:
+            self.configure(legacy=False)
 
-            return getattr(types, name)
+        if self._legacy and not self._warned_legacy:
+            warnings.warn(
+                "Using phply as AST backend is deprecated. "
+                "Remove the phply dependency and use native bashe.types "
+                "for full PHP 8.x syntax support and better performance.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _PhpAstProxy._warned_legacy = True
+
+        try:
+            return getattr(self._module, name)
+        except AttributeError:
+            if self._legacy:
+                raise AttributeError(
+                    f"Type {name!r} is not available in phply. "
+                    f"Remove phply and use native bashe.types instead."
+                )
+            raise
 
 
 php = _PhpAstProxy()
@@ -1363,6 +1395,8 @@ def property_decl(ts_node, ctx):
             modifiers.append(ctx.text(c).strip().lower())
         elif c.type == "static_modifier":
             modifiers.append("static")
+        elif c.type == "readonly_modifier":
+            modifiers.append("readonly")
         elif c.type == "property_element":
             name_n = c.child_by_field_name("name")
             val_n = c.child_by_field_name("default_value")
@@ -1412,7 +1446,7 @@ def class_decl(ts_node, ctx):
     interfaces = []
 
     for c in ts_node.children:
-        if c.type in ("final_modifier", "abstract_modifier"):
+        if c.type in ("final_modifier", "abstract_modifier", "readonly_modifier"):
             modifiers.append(ctx.text(c).lower().strip())
         elif c.type == "base_clause":
             for bc in c.named_children:
@@ -1593,6 +1627,11 @@ def translate(ts_node, ctx):
         return handler(ts_node, ctx)
 
     # Fallback: translate named children
+    logger.warning(
+        "No handler for node type %r at line %d. Falling back to named children.",
+        ts_node.type,
+        ts_node.start_point[0] + 1,
+    )
     if ts_node.named_children:
         res = []
         for c in ts_node.named_children:
@@ -1608,6 +1647,9 @@ def translate(ts_node, ctx):
 
 
 class Bashe:
+    def __init__(self, legacy=False):
+        _PhpAstProxy.configure(legacy=legacy)
+
     def parse(self, code: str, filename: str = None):
         src = bytes(code, "utf8")
         tree = _parser.parse(src)

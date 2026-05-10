@@ -1,18 +1,7 @@
 """Tests for PHP 5.4+ / 7.x / 8.x syntax that phply does not support.
 
-Uses native ``bashe.types`` types exclusively — no phply compatibility
-required for these modern PHP features.
+Always uses native ``bashe.types`` regardless of whether phply is installed.
 """
-
-import pytest
-
-from bashe.parser import php as _php
-
-if _php.__name__ != "bashe.types":
-    pytest.skip(
-        "phply active — PHP 7/8 native tests require bashe.types",
-        allow_module_level=True,
-    )
 
 from bashe.types import (
     Array,
@@ -21,6 +10,8 @@ from bashe.types import (
     Assignment,
     BinaryOp,
     Class,
+    ClassVariable,
+    ClassVariables,
     ConstructorParameter,
     Echo,
     FormalParameter,
@@ -79,7 +70,7 @@ $obj->hello();
         Assignment(Variable("$obj"), New("World", []), False),
         MethodCall(Variable("$obj"), "hello", []),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -106,7 +97,7 @@ function add(int $a, int $b): int {
             "int",
         ),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 def test_php7_null_coalesce():
@@ -121,7 +112,7 @@ $name = $_GET["user"] ?? 'Guest';
             False,
         ),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 def test_php7_spaceship():
@@ -132,7 +123,7 @@ $result = 1 <=> 2;
     expected = [
         Assignment(Variable("$result"), BinaryOp("<=>", 1, 2), False),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -171,7 +162,7 @@ class User {
             ],
         ),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 def test_php8_named_arguments():
@@ -186,7 +177,7 @@ $user = new User(age: 25, name: "Alice");
             False,
         ),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 def test_php8_nullsafe():
@@ -205,7 +196,7 @@ $city = $user?->address?->getCity();
             False,
         ),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
 
 
 def test_php8_match_expression():
@@ -229,4 +220,104 @@ echo match($user->name) {
             ]
         ),
     ]
-    eq_ast(input, expected)
+    eq_ast(input, expected, legacy=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PHP 8.1
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_php81_readonly_property():
+    """Readonly property modifier (PHP 8.1)."""
+    input = """<?php
+class User {
+    public readonly string $name;
+}
+"""
+    expected = [
+        Class(
+            "User",
+            None,
+            None,
+            [],
+            [],
+            [
+                ClassVariables(
+                    ["public", "readonly"],
+                    [ClassVariable("$name", None)],
+                ),
+            ],
+        ),
+    ]
+    eq_ast(input, expected, legacy=False)
+
+
+def test_php81_intersection_type():
+    """Intersection type hints — Countable&Iterator (PHP 8.1)."""
+    input = """<?php
+function process(Countable&Iterator $input): void {}
+"""
+    expected = [
+        Function(
+            "process",
+            [
+                FormalParameter("$input", None, False, "Countable&Iterator"),
+            ],
+            [],
+            False,
+            "void",
+        ),
+    ]
+    eq_ast(input, expected, legacy=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PHP 8.2
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def test_php82_readonly_class():
+    """Readonly class — all properties implicitly readonly (PHP 8.2)."""
+    input = """<?php
+readonly class Config {
+    public string $host;
+}
+"""
+    expected = [
+        Class(
+            "Config",
+            "readonly",
+            None,
+            [],
+            [],
+            [
+                ClassVariables(
+                    ["public"],
+                    [ClassVariable("$host", None)],
+                ),
+            ],
+        ),
+    ]
+    eq_ast(input, expected, legacy=False)
+
+
+def test_php82_dnf_type():
+    """DNF (Disjunctive Normal Form) type — (A&B)|C (PHP 8.2)."""
+    input = """<?php
+function handle((Countable&Iterator)|null $data): void {}
+"""
+    expected = [
+        Function(
+            "handle",
+            [
+                FormalParameter(
+                    "$data", None, False, "(Countable&Iterator)|null"
+                ),
+            ],
+            [],
+            False,
+            "void",
+        ),
+    ]
+    eq_ast(input, expected, legacy=False)

@@ -2,11 +2,22 @@
 
 from bashe.parser import Bashe
 
-parser = Bashe()
+try:
+    import phply  # noqa: F401
+
+    _LEGACY = True
+except ImportError:
+    _LEGACY = False
+
+parser = Bashe(legacy=_LEGACY)
 
 
-def eq_ast(input, expected, filename=None, with_top_lineno=False):
-    output = parser.parse(input, filename)
+def eq_ast(input, expected, filename=None, with_top_lineno=False, legacy=None):
+    if legacy is None:
+        bashe = parser
+    else:
+        bashe = Bashe(legacy=legacy)
+    output = bashe.parse(input, filename)
 
     diff = None
     try:
