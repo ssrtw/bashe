@@ -1,0 +1,13 @@
+[package]
+name = "bashe"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "bashe"
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+tree-sitter = "0.26"
+tree-sitter-php = "0.24"

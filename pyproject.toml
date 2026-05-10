@@ -1,13 +1,10 @@
 [project]
 name = "bashe"
-version = "0.1.2"
-description = "A Tree-sitter based PHP parser for Python, featuring compatibility with phply."
+version = "0.2.0"
+description = "A Tree-sitter based PHP parser (Rust + PyO3)"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-  "tree-sitter>=0.25.2",
-  "tree-sitter-php>=0.24.1",
-]
+dependencies = []
 
 [project.optional-dependencies]
 phply = ["phply>=1.2.6"]
@@ -19,10 +16,15 @@ dev = [
   "pytest>=7",
 ]
 
+[build-system]
+requires = ["maturin>=1.8"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "bashe"
+
 [tool.pytest]
 filterwarnings = [
-  "ignore::DeprecationWarning:bashe.parser",
+  "ignore::DeprecationWarning",
 ]
-
-[tool.setuptools.packages.find]
-exclude = ["assets"]
