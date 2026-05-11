@@ -24,6 +24,9 @@ full PHP 7/8 support — and runs **5× faster** than phply.
   `__FUNCTION__`, etc.) resolved during parsing
 - Built on Rust/PyO3 — tree-sitter parsing and AST translation
   happen entirely in native code
+- Known limitation: curly-brace string offset (`$str{0}`) is not
+  supported; this syntax was deprecated in PHP 7.4 and removed in
+  PHP 8.0. Use bracket offset (`$str[0]`) instead
 
 ## Installation
 

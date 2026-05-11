@@ -148,7 +148,7 @@ ast_node!(
     TryNode {
         nodes,
         catches,
-        finally
+        finally_
     }
 );
 ast_node!("Catch", CatchNode { class_, var, nodes });
@@ -266,7 +266,6 @@ ast_node!("FunctionCall", FunctionCall { name, params });
 ast_node!("Array", Array { nodes });
 ast_node!("ArrayElement", ArrayElement { key, value, is_ref });
 ast_node!("ArrayOffset", ArrayOffset { node, expr });
-ast_node!("StringOffset", StringOffset { node, expr });
 ast_node!("ObjectProperty", ObjectProperty { node, name });
 ast_node!("StaticProperty", StaticProperty { node, name });
 ast_node!("MethodCall", MethodCall { node, name, params });
@@ -325,7 +324,7 @@ ast_node!("TraitUse", TraitUse { name, renames });
 ast_node!(
     "TraitModifier",
     TraitModifier {
-        from,
+        from_,
         to,
         visibility
     }
@@ -408,7 +407,6 @@ pub fn register_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Array>()?;
     m.add_class::<ArrayElement>()?;
     m.add_class::<ArrayOffset>()?;
-    m.add_class::<StringOffset>()?;
     m.add_class::<ObjectProperty>()?;
     m.add_class::<StaticProperty>()?;
     m.add_class::<MethodCall>()?;

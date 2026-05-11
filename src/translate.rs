@@ -1297,29 +1297,15 @@ fn translate_with_ctx(
                     }
                 }
             }
-            // Check for { in text → StringOffset
-            let text = text_of(&node, source);
-            if text.contains('{') {
-                let so = Py::new(
-                    py,
-                    StringOffset {
-                        lineno: lno,
-                        node: obj,
-                        expr: idx,
-                    },
-                )?;
-                Some(so.into_any())
-            } else {
-                let a = Py::new(
-                    py,
-                    ArrayOffset {
-                        lineno: lno,
-                        node: obj,
-                        expr: idx,
-                    },
-                )?;
-                Some(a.into_any())
-            }
+            let a = Py::new(
+                py,
+                ArrayOffset {
+                    lineno: lno,
+                    node: obj,
+                    expr: idx,
+                },
+            )?;
+            Some(a.into_any())
         }
         "scoped_property_access_expression" => {
             let scope_n = field_child(&node, "scope");
@@ -2597,7 +2583,7 @@ fn translate_with_ctx(
                 py,
                 TraitModifier {
                     lineno: lno,
-                    from: original,
+                    from_: original,
                     to: alias
                         .map(|a| make_str(py, &a))
                         .unwrap_or_else(|| make_none(py)),
@@ -3196,7 +3182,7 @@ fn translate_with_ctx(
                     lineno: lno,
                     nodes: body_items.into(),
                     catches: catches.into(),
-                    finally: finally_block.unwrap_or_else(|| make_none(py)),
+                    finally_: finally_block.unwrap_or_else(|| make_none(py)),
                 },
             )?;
             Some(t.into_any())
