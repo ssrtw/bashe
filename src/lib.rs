@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 use tree_sitter::Parser;
 
+use ast::register_types;
 use translate::translate_root;
 
 #[pyclass(name = "Bashe")]
@@ -23,14 +24,20 @@ impl Bashe {
         Ok(Self { parser })
     }
 
-    fn parse(&mut self, py: Python<'_>, code: &str) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (code, filename=None))]
+    fn parse(
+        &mut self,
+        py: Python<'_>,
+        code: &str,
+        filename: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
         let bytes = code.as_bytes();
         let tree = self
             .parser
             .parse(bytes, None)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("parse failed"))?;
         let root = tree.root_node();
-        let result = translate_root(root, bytes, py)?;
+        let result = translate_root(root, bytes, py, filename)?;
         match result.cast_bound::<PyList>(py) {
             Ok(list) => Ok(list.clone().into()),
             Err(_) => {
@@ -44,6 +51,7 @@ impl Bashe {
 
 #[pymodule]
 fn bashe(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_types(m)?;
     m.add_class::<Bashe>()?;
     Ok(())
 }

@@ -6,6 +6,46 @@ use tree_sitter::Node;
 
 use crate::ast::*;
 
+// ── context for tracking namespace/class/function ──────────────────
+
+#[derive(Clone, Default)]
+struct Ctx {
+    namespace: Option<String>,
+    function: Option<String>,
+    class_: Option<String>,
+    method: Option<String>,
+    filename: Option<String>,
+    string_mode: bool,
+}
+
+impl Ctx {
+    fn resolve_magic(&self, txt: &str) -> Option<String> {
+        match txt {
+            "__FUNCTION__" => self.function.clone(),
+            "__METHOD__" => self.method.clone(),
+            "__CLASS__" => self.class_.clone(),
+            "__NAMESPACE__" => self.namespace.clone(),
+            "__FILE__" => self.filename.clone(),
+            "__DIR__" => self
+                .filename
+                .as_ref()
+                .and_then(|f| std::path::Path::new(f).parent())
+                .map(|p| p.to_string_lossy().to_string()),
+            "__TRAIT__" => None,
+            _ => None,
+        }
+    }
+
+    fn qualify_name(&self, name: &str) -> String {
+        if let Some(ref ns) = self.namespace {
+            if !ns.is_empty() {
+                return format!("{}\\{}", ns, name);
+            }
+        }
+        name.to_string()
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 fn lineno(node: &Node) -> Option<usize> {
@@ -14,6 +54,96 @@ fn lineno(node: &Node) -> Option<usize> {
 
 fn text_of<'a>(node: &Node, source: &'a [u8]) -> &'a str {
     node.utf8_text(source).unwrap_or("")
+}
+
+fn unescape_string(s: &str, is_double: bool) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    if !is_double {
+        let mut res = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < len {
+            if chars[i] == '\\' && i + 1 < len {
+                let nxt = chars[i + 1];
+                if nxt == '\\' {
+                    res.push('\\');
+                } else if nxt == '\'' {
+                    res.push('\'');
+                } else {
+                    res.push('\\');
+                    res.push(nxt);
+                }
+                i += 2;
+            } else {
+                res.push(chars[i]);
+                i += 1;
+            }
+        }
+        res
+    } else {
+        let mut res = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < len {
+            if chars[i] == '\\' && i + 1 < len {
+                let nxt = chars[i + 1];
+                match nxt {
+                    'n' => res.push('\n'),
+                    'r' => res.push('\r'),
+                    't' => res.push('\t'),
+                    'v' => res.push('\x0b'),
+                    'e' => res.push('\x1b'),
+                    'f' => res.push('\x0c'),
+                    '\\' => res.push('\\'),
+                    '"' => res.push('"'),
+                    '$' => res.push('$'),
+                    'x' => {
+                        if i + 3 < len {
+                            let hex: String = chars[i + 2..i + 4].iter().collect();
+                            if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                                if let Some(c) = char::from_u32(code) {
+                                    res.push(c);
+                                    i += 4;
+                                    continue;
+                                }
+                            }
+                        }
+                        res.push_str("\\x");
+                        i += 2;
+                        continue;
+                    }
+                    d if d.is_ascii_digit() => {
+                        let mut oct = String::new();
+                        let mut j = 0;
+                        while i + 1 + j < len && j < 3 && chars[i + 1 + j].is_ascii_digit() {
+                            oct.push(chars[i + 1 + j]);
+                            j += 1;
+                        }
+                        if let Ok(code) = u32::from_str_radix(&oct, 8) {
+                            if let Some(c) = char::from_u32(code) {
+                                res.push(c);
+                                i += 1 + j;
+                                continue;
+                            }
+                        }
+                        res.push(nxt);
+                        i += 2;
+                        continue;
+                    }
+                    _ => {
+                        res.push(nxt);
+                    }
+                }
+                i += 2;
+            } else {
+                res.push(chars[i]);
+                i += 1;
+            }
+        }
+        res
+    }
 }
 
 fn field_child<'a>(node: &Node<'a>, field: &str) -> Option<Node<'a>> {
@@ -56,6 +186,384 @@ fn make_none(py: Python<'_>) -> Py<PyAny> {
     py.None()
 }
 
+fn process_encapsed_parts(
+    node: &Node,
+    source: &[u8],
+    py: Python<'_>,
+    is_double: bool,
+    ctx: &mut Ctx,
+) -> PyResult<Py<PyAny>> {
+    let mut parts: Vec<Py<PyAny>> = Vec::new();
+    let prev_string_mode = ctx.string_mode;
+    ctx.string_mode = true;
+    process_string_children(node, source, py, is_double, &mut parts, &mut None, ctx)?;
+    ctx.string_mode = prev_string_mode;
+    build_string_result(py, parts)
+}
+
+fn process_string_children(
+    node: &Node,
+    source: &[u8],
+    py: Python<'_>,
+    is_double: bool,
+    parts: &mut Vec<Py<PyAny>>,
+    prev_end: &mut Option<usize>,
+    ctx: &mut Ctx,
+) -> PyResult<()> {
+    let child_count = node.child_count() as u32;
+    let mut i: u32 = 0;
+    while i < child_count {
+        if let Some(child) = node.child(i) {
+            let ck = child.kind();
+            match ck {
+                "string_content" | "escape_sequence" | "heredoc_content" | "nowdoc_content"
+                | "nowdoc_string" => {
+                    let start = prev_end.unwrap_or_else(|| child.start_byte());
+                    let end = child.end_byte();
+                    if start < end {
+                        let txt = std::str::from_utf8(&source[start..end]).unwrap_or("");
+                        let unescaped = unescape_string(txt, is_double);
+                        if !unescaped.is_empty() || ck == "string_content" {
+                            let merged = parts
+                                .last()
+                                .and_then(|p| p.bind(py).extract::<String>().ok())
+                                .map(|s| s + &unescaped);
+                            if let Some(s) = merged {
+                                parts.pop();
+                                parts.push(make_str(py, &s));
+                            } else {
+                                parts.push(make_str(py, &unescaped));
+                            }
+                        }
+                    }
+                    *prev_end = Some(end);
+                }
+                "heredoc_body" | "nowdoc_body" => {
+                    process_string_children(&child, source, py, is_double, parts, prev_end, ctx)?;
+                }
+                "{" => {
+                    // Check for { expr } triplet
+                    if i + 2 < child_count {
+                        if let (Some(inner), Some(close)) = (node.child(i + 1), node.child(i + 2)) {
+                            if close.kind() == "}" {
+                                if inner.is_named() {
+                                    let res = translate_with_ctx(inner, source, py, ctx)?
+                                        .unwrap_or_else(|| make_none(py));
+                                    if inner.kind() == "dynamic_variable_name" {
+                                        let v = Py::new(
+                                            py,
+                                            Variable {
+                                                lineno: lineno(&inner),
+                                                name: res,
+                                            },
+                                        )?;
+                                        parts.push(v.into_any());
+                                    } else {
+                                        parts.push(res);
+                                    }
+                                }
+                                *prev_end = Some(close.end_byte());
+                                i += 3;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                "}" => {
+                    // standalone } - skip
+                }
+                "ERROR" => {
+                    let start = prev_end.unwrap_or_else(|| child.start_byte());
+                    let end = child.end_byte();
+                    if start < end {
+                        let txt = std::str::from_utf8(&source[start..end]).unwrap_or("");
+                        let unescaped = unescape_string(txt, is_double);
+                        if !unescaped.is_empty() {
+                            let merged = parts
+                                .last()
+                                .and_then(|p| p.bind(py).extract::<String>().ok())
+                                .map(|s| s + &unescaped);
+                            if let Some(s) = merged {
+                                parts.pop();
+                                parts.push(make_str(py, &s));
+                            } else {
+                                parts.push(make_str(py, &unescaped));
+                            }
+                        }
+                    }
+                    *prev_end = Some(end);
+                }
+                _ if child.is_named()
+                    && !is_skip(ck)
+                    && !matches!(
+                        ck,
+                        "heredoc_start"
+                            | "heredoc_end"
+                            | "nowdoc_start"
+                            | "nowdoc_end"
+                            | "shell_command_start"
+                            | "shell_command_end"
+                    ) =>
+                {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
+                        parts.push(obj);
+                    }
+                    *prev_end = Some(child.end_byte());
+                }
+                _ => {
+                    // skip without updating prev_end
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn build_string_result(py: Python<'_>, mut parts: Vec<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    if parts.is_empty() {
+        return Ok(make_str(py, ""));
+    }
+    if parts.len() == 1 {
+        return Ok(parts.remove(0));
+    }
+    let all_scalar = parts.iter().all(|p| {
+        let b = p.bind(py);
+        b.extract::<String>().is_ok() || b.extract::<i64>().is_ok() || b.extract::<f64>().is_ok()
+    });
+    if all_scalar {
+        let combined: String = parts
+            .iter()
+            .map(|p| {
+                let b = p.bind(py);
+                if let Ok(s) = b.extract::<String>() {
+                    s
+                } else if let Ok(v) = b.extract::<i64>() {
+                    v.to_string()
+                } else if let Ok(v) = b.extract::<f64>() {
+                    v.to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        return Ok(make_str(py, &combined));
+    }
+    let mut result = parts.remove(0);
+    for part in parts {
+        result = Py::new(
+            py,
+            BinaryOp {
+                lineno: None,
+                op: make_str(py, "."),
+                left: result,
+                right: part,
+            },
+        )?
+        .into_any();
+    }
+    Ok(result)
+}
+
+// ── dv_translate ──────────────────────────────────────────────────
+// Dynamic variable context translation — names become Variables
+fn dv_translate(
+    node: Node,
+    source: &[u8],
+    py: Python<'_>,
+    ctx: &mut Ctx,
+) -> PyResult<Option<Py<PyAny>>> {
+    let kind = node.kind();
+    let lno = lineno(&node);
+    match kind {
+        "name" => {
+            let v = Py::new(
+                py,
+                Variable {
+                    lineno: lno,
+                    name: make_str(py, &format!("${}", text_of(&node, source))),
+                },
+            )?;
+            Ok(Some(v.into_any()))
+        }
+        "subscript_expression" => {
+            let obj = node
+                .named_child(0)
+                .and_then(|n| dv_translate(n, source, py, ctx).ok().flatten())
+                .unwrap_or_else(|| make_none(py));
+            let idx_node = node.named_child(1);
+            let idx_is_name = idx_node.is_some_and(|n| {
+                let k = n.kind();
+                k == "name"
+                    || k == "qualified_name"
+                    || k == "fully_qualified_name"
+                    || k == "relative_name"
+            });
+            let idx = idx_node
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
+                .unwrap_or_else(|| make_none(py));
+            let idx = if idx_is_name {
+                idx.bind(py)
+                    .getattr("name")
+                    .map(|n| n.into())
+                    .unwrap_or(idx)
+            } else {
+                idx
+            };
+            let a = Py::new(
+                py,
+                ArrayOffset {
+                    lineno: lno,
+                    node: obj,
+                    expr: idx,
+                },
+            )?;
+            Ok(Some(a.into_any()))
+        }
+        "member_access_expression" => {
+            let obj = field_child(&node, "object")
+                .and_then(|n| dv_translate(n, source, py, ctx).ok().flatten())
+                .unwrap_or_else(|| make_none(py));
+            let nm = field_child(&node, "name")
+                .map(|n| make_str(py, text_of(&n, source)))
+                .unwrap_or_else(|| make_str(py, ""));
+            let op = Py::new(
+                py,
+                ObjectProperty {
+                    lineno: lno,
+                    node: obj,
+                    name: nm,
+                },
+            )?;
+            Ok(Some(op.into_any()))
+        }
+        "scoped_property_access_expression" => {
+            let scope = field_child(&node, "scope")
+                .map(|n| make_str(py, text_of(&n, source)))
+                .unwrap_or_else(|| make_str(py, ""));
+            let name_n = field_child(&node, "name");
+            let name = if let Some(nn) = name_n {
+                if nn.kind() == "variable_name" {
+                    translate_with_ctx(nn, source, py, ctx)
+                        .ok()
+                        .and_then(|o| o)
+                        .unwrap_or_else(|| make_none(py))
+                } else {
+                    make_str(py, text_of(&nn, source))
+                }
+            } else {
+                make_str(py, "")
+            };
+            let sp = Py::new(
+                py,
+                StaticProperty {
+                    lineno: lno,
+                    node: scope,
+                    name,
+                },
+            )?;
+            Ok(Some(sp.into_any()))
+        }
+        "class_constant_access_expression" => {
+            let scope = node
+                .named_child(0)
+                .map(|n| make_str(py, text_of(&n, source)))
+                .unwrap_or_else(|| make_str(py, ""));
+            let nm = node
+                .named_child(1)
+                .map(|n| make_str(py, text_of(&n, source)))
+                .unwrap_or_else(|| make_str(py, ""));
+            let sp = Py::new(
+                py,
+                StaticProperty {
+                    lineno: lno,
+                    node: scope,
+                    name: nm,
+                },
+            )?;
+            Ok(Some(sp.into_any()))
+        }
+        "member_call_expression" => {
+            let obj = field_child(&node, "object")
+                .and_then(|n| dv_translate(n, source, py, ctx).ok().flatten())
+                .unwrap_or_else(|| make_none(py));
+            let nm = field_child(&node, "name")
+                .map(|n| make_str(py, text_of(&n, source)))
+                .unwrap_or_else(|| make_str(py, ""));
+            let args_node = field_child(&node, "arguments");
+            let args = args_node
+                .map(|a| {
+                    let list = PyList::empty(py);
+                    let mut cursor = a.walk();
+                    for c in a.named_children(&mut cursor) {
+                        if let Some(o) = translate_with_ctx(c, source, py, ctx).unwrap_or(None) {
+                            list.append(o).ok();
+                        }
+                    }
+                    list.into()
+                })
+                .unwrap_or_else(|| PyList::empty(py).into());
+            let mc = Py::new(
+                py,
+                MethodCall {
+                    lineno: lno,
+                    node: obj,
+                    name: nm,
+                    params: args,
+                },
+            )?;
+            Ok(Some(mc.into_any()))
+        }
+        "function_call_expression" => {
+            let fname = field_child(&node, "function")
+                .map(|n| make_str(py, text_of(&n, source)))
+                .unwrap_or_else(|| make_str(py, ""));
+            let args_node = field_child(&node, "arguments");
+            let args = args_node
+                .map(|a| {
+                    let list = PyList::empty(py);
+                    let mut cursor = a.walk();
+                    for c in a.named_children(&mut cursor) {
+                        if let Some(o) = translate_with_ctx(c, source, py, ctx).unwrap_or(None) {
+                            list.append(o).ok();
+                        }
+                    }
+                    list.into()
+                })
+                .unwrap_or_else(|| PyList::empty(py).into());
+            let fc = Py::new(
+                py,
+                FunctionCall {
+                    lineno: lno,
+                    name: fname,
+                    params: args,
+                },
+            )?;
+            Ok(Some(fc.into_any()))
+        }
+        _ => translate_with_ctx(node, source, py, ctx),
+    }
+}
+
+fn unwrap_block_body(py: Python<'_>, obj: Py<PyAny>) -> Py<PyAny> {
+    obj.bind(py)
+        .getattr("nodes")
+        .map(|n| n.into())
+        .unwrap_or(obj)
+}
+
+fn append_unwrapped(py: Python<'_>, list: &Bound<'_, PyList>, obj: Py<PyAny>) -> PyResult<()> {
+    let nodz = unwrap_block_body(py, obj);
+    if let Ok(seq) = nodz.bind(py).cast::<PyList>() {
+        for i in 0..seq.len() {
+            list.append(seq.get_item(i)?)?;
+        }
+    } else {
+        list.append(nodz)?;
+    }
+    Ok(())
+}
+
 const SKIP_TYPES: &[&str] = &[
     "?>",
     "<?php",
@@ -78,18 +586,150 @@ fn is_skip(kind: &str) -> bool {
 
 // ── main translate ───────────────────────────────────────────────────
 
-pub fn translate_root(root: Node, source: &[u8], py: Python<'_>) -> PyResult<Py<PyAny>> {
+pub fn translate_root(
+    root: Node,
+    source: &[u8],
+    py: Python<'_>,
+    filename: Option<String>,
+) -> PyResult<Py<PyAny>> {
     let list = PyList::empty(py);
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if let Some(obj) = translate(child, source, py)? {
-            list.append(obj)?;
+    let mut echo_mode = false;
+    let mut ctx = Ctx {
+        filename,
+        ..Ctx::default()
+    };
+    for i in 0..root.child_count() {
+        if let Some(child) = root.child(i as u32) {
+            process_program_child(child, source, py, &list, &mut echo_mode, &mut ctx)?;
         }
     }
     Ok(list.into())
 }
 
-fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+fn process_program_child(
+    child: Node,
+    source: &[u8],
+    py: Python<'_>,
+    list: &Bound<'_, PyList>,
+    echo_mode: &mut bool,
+    ctx: &mut Ctx,
+) -> PyResult<()> {
+    let ckind = child.kind();
+    if is_skip(ckind) {
+        return Ok(());
+    }
+    let lno = lineno(&child);
+    if ckind == "text" {
+        let txt = text_of(&child, source);
+        if !txt.is_empty() {
+            if *echo_mode {
+                let items = PyList::empty(py);
+                items.append(make_str(py, txt))?;
+                let echo = Py::new(
+                    py,
+                    Echo {
+                        lineno: lno,
+                        nodes: items.into(),
+                    },
+                )?;
+                list.append(echo.into_any())?;
+                *echo_mode = false;
+            } else {
+                let ih = Py::new(
+                    py,
+                    InlineHTML {
+                        lineno: lno,
+                        data: make_str(py, txt),
+                    },
+                )?;
+                list.append(ih.into_any())?;
+            }
+        }
+    } else if ckind == "php_tag" {
+        let txt = text_of(&child, source).trim();
+        *echo_mode = txt == "<?=";
+    } else if ckind == "text_interpolation" {
+        let mut ti_prev_end: Option<usize> = None;
+        for j in 0..child.child_count() {
+            if let Some(ti_child) = child.child(j as u32) {
+                let tik = ti_child.kind();
+                if tik == "text" {
+                    let start = if let Some(prev) = ti_prev_end {
+                        prev
+                    } else {
+                        ti_child.start_byte()
+                    };
+                    let end = ti_child.end_byte();
+                    let txt = if start < end && start < source.len() && end <= source.len() {
+                        std::str::from_utf8(&source[start..end]).unwrap_or("")
+                    } else {
+                        text_of(&ti_child, source)
+                    };
+                    if !txt.is_empty() {
+                        let ih = Py::new(
+                            py,
+                            InlineHTML {
+                                lineno: lno,
+                                data: make_str(py, txt),
+                            },
+                        )?;
+                        list.append(ih.into_any())?;
+                    }
+                } else if tik == "php_tag" {
+                    let txt = text_of(&ti_child, source).trim();
+                    *echo_mode = txt == "<?=";
+                } else if tik == "php_end_tag" {
+                    ti_prev_end = Some(ti_child.end_byte());
+                } else if !is_skip(tik) {
+                    if let Some(res) = translate_with_ctx(ti_child, source, py, ctx)? {
+                        emit_result(res, py, list, echo_mode, lno)?;
+                    }
+                }
+            }
+        }
+    } else if ckind == "php_end_tag" {
+        // skip
+    } else if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
+        emit_result(obj, py, list, echo_mode, lno)?;
+    }
+    Ok(())
+}
+
+fn emit_result(
+    obj: Py<PyAny>,
+    py: Python<'_>,
+    list: &Bound<'_, PyList>,
+    echo_mode: &mut bool,
+    lno: Option<usize>,
+) -> PyResult<()> {
+    if *echo_mode {
+        let items = PyList::empty(py);
+        items.append(obj)?;
+        let echo = Py::new(
+            py,
+            Echo {
+                lineno: lno,
+                nodes: items.into(),
+            },
+        )?;
+        list.append(echo.into_any())?;
+        *echo_mode = false;
+    } else if let Ok(seq) = obj.cast_bound::<PyList>(py) {
+        for k in 0..seq.len() {
+            list.append(seq.get_item(k)?)?;
+        }
+    } else {
+        list.append(obj)?;
+    }
+    Ok(())
+}
+
+fn translate_with_ctx(
+    node: Node,
+    source: &[u8],
+    py: Python<'_>,
+    ctx: &mut Ctx,
+) -> PyResult<Option<Py<PyAny>>> {
     let kind = node.kind();
     if is_skip(kind) {
         return Ok(None);
@@ -100,30 +740,63 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         // ── program / namespace / compound ──────────────────────
         "program" | "namespace_definition" | "declaration_list" => {
             let list = PyList::empty(py);
-            if kind == "namespace_definition" {
+            let mut echo_mode = false;
+            let ns_name = if kind == "namespace_definition" {
                 let name_node = field_child(&node, "name");
-                let _ns_name = name_node.map(|n| text_of(&n, source).to_string());
-                // TODO: handle namespace wrapping
+                name_node.map(|n| text_of(&n, source).to_string())
+            } else {
+                None
+            };
+            let old_ns = ctx.namespace.clone();
+            if let Some(ref ns) = ns_name {
+                ctx.namespace = Some(ns.clone());
             }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if is_skip(child.kind()) {
-                    continue;
-                }
-                if let Some(obj) = translate(child, source, py)? {
-                    if let Ok(seq) = obj.cast_bound::<PyList>(py) {
-                        for i in 0..seq.len() {
-                            list.append(seq.get_item(i)?)?;
-                        }
-                    } else {
-                        list.append(obj)?;
-                    }
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i as u32) {
+                    process_program_child(child, source, py, &list, &mut echo_mode, ctx)?;
                 }
             }
             if kind == "namespace_definition" {
-                // Simplify: just return inner block
+                let has_decl_list = (0..node.child_count()).any(|i| {
+                    node.child(i as u32)
+                        .is_some_and(|c| c.kind() == "declaration_list")
+                });
+                if has_decl_list {
+                    ctx.namespace = old_ns;
+                }
+                let ns_nodes = if list.len() == 1 {
+                    let item: Py<PyAny> = list.get_item(0)?.into();
+                    let cls_name = item
+                        .bind(py)
+                        .getattr("__class__")
+                        .and_then(|c| c.getattr("__name__"))
+                        .and_then(|n| n.extract::<String>())
+                        .unwrap_or_default();
+                    if cls_name == "Block" {
+                        item.bind(py)
+                            .getattr("nodes")
+                            .map(|n| n.into())
+                            .unwrap_or_else(|_| list.into())
+                    } else {
+                        list.into()
+                    }
+                } else {
+                    list.into()
+                };
+                let n = Py::new(
+                    py,
+                    Namespace {
+                        lineno: lno,
+                        name: ns_name
+                            .map(|n| make_str(py, &n))
+                            .unwrap_or_else(|| make_none(py)),
+                        nodes: ns_nodes,
+                    },
+                )?;
+                Some(n.into_any())
+            } else {
+                Some(list.into())
             }
-            Some(list.into())
         }
         "compound_statement" | "colon_block" => {
             let list = PyList::empty(py);
@@ -132,7 +805,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 if child.kind() == "{" || child.kind() == "}" {
                     continue;
                 }
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     if let Ok(seq) = obj.cast_bound::<PyList>(py) {
                         for i in 0..seq.len() {
                             list.append(seq.get_item(i)?)?;
@@ -153,7 +826,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "expression_statement" => node
             .named_child(0)
-            .and_then(|c| translate(c, source, py).transpose())
+            .and_then(|c| translate_with_ctx(c, source, py, ctx).transpose())
             .transpose()?,
 
         // ── literals ─────────────────────────────────────────────
@@ -166,10 +839,16 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let n: f64 = text.parse().unwrap_or(0.0);
             Some(n.into_pyobject(py).unwrap().into_any().unbind())
         }
-        "string" | "encapsed_string" | "heredoc" | "nowdoc" => {
-            let text = text_of(&node, source);
-            Some(make_str(py, text))
+        "string" => {
+            let is_double = text_of(&node, source).trim_start().starts_with('"');
+            Some(process_encapsed_parts(&node, source, py, is_double, ctx)?)
         }
+        "encapsed_string" => {
+            let is_double = text_of(&node, source).trim_start().starts_with('"');
+            Some(process_encapsed_parts(&node, source, py, is_double, ctx)?)
+        }
+        "heredoc" => Some(process_encapsed_parts(&node, source, py, true, ctx)?),
+        "nowdoc" => Some(process_encapsed_parts(&node, source, py, false, ctx)?),
         "variable_name" => {
             let name = text_of(&node, source);
             let v = Py::new(
@@ -184,7 +863,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "variable_variable" => {
             let inner = node
                 .named_child(0)
-                .and_then(|c| translate(c, source, py).ok().flatten())
+                .and_then(|c| translate_with_ctx(c, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let v = Py::new(
                 py,
@@ -198,8 +877,37 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "name" | "qualified_name" | "fully_qualified_name" | "relative_name" => {
             let txt = text_of(&node, source);
             let lower = txt.to_lowercase();
-            if lower == "static" || lower == "self" || lower == "parent" {
+            if lower == "die" {
+                let e = Py::new(
+                    py,
+                    Exit {
+                        lineno: lno,
+                        expr: make_none(py),
+                        type_: make_str(py, "die"),
+                    },
+                )?;
+                Some(e.into_any())
+            } else if lower == "static" || lower == "self" || lower == "parent" {
                 Some(make_str(py, &lower))
+            } else if txt.len() > 2
+                && txt.starts_with("__")
+                && txt.ends_with("__")
+                && txt.chars().all(|c| c == '_' || c.is_ascii_uppercase())
+            {
+                let value = if txt == "__LINE__" {
+                    lno.map(|ln| make_int(py, ln as i64))
+                } else {
+                    ctx.resolve_magic(txt).map(|v| make_str(py, &v))
+                };
+                let mc = Py::new(
+                    py,
+                    MagicConstant {
+                        lineno: lno,
+                        name: make_str(py, txt),
+                        value: value.unwrap_or_else(|| make_none(py)),
+                    },
+                )?;
+                Some(mc.into_any())
             } else {
                 let c = Py::new(
                     py,
@@ -221,13 +929,14 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 let key_node = field_child(&child, "key");
                 let val_node = field_child(&child, "value");
                 let is_ref_val = text_of(&child, source).contains("&");
-                let key = key_node.and_then(|n| translate(n, source, py).ok().flatten());
+                let key =
+                    key_node.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                 let val = val_node
-                    .and_then(|n| translate(n, source, py).ok().flatten())
+                    .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                     .or_else(|| {
                         child
                             .named_child(0)
-                            .and_then(|c| translate(c, source, py).ok().flatten())
+                            .and_then(|c| translate_with_ctx(c, source, py, ctx).ok().flatten())
                     });
                 let ae = Py::new(
                     py,
@@ -253,7 +962,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let items = PyList::empty(py);
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     items.append(obj)?;
                 }
             }
@@ -263,20 +972,43 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         // ── operators ───────────────────────────────────────────
         "assignment_expression" | "augmented_assignment_expression" => {
             let left_node = field_child(&node, "left");
+            let left_kind = left_node.map(|n| n.kind().to_string()).unwrap_or_default();
             let right_node = field_child(&node, "right");
-            let left = left_node.and_then(|n| translate(n, source, py).ok().flatten());
-            let right = right_node.and_then(|n| translate(n, source, py).ok().flatten());
-            let op_text = text_of(&node, source);
-            let op = if op_text.contains("=&") {
-                "="
-            } else if op_text.contains("=") {
-                op_text.split('=').next().unwrap_or("=").trim()
+            let left =
+                left_node.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
+            let right =
+                right_node.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
+            // Extract operator: text between left child end and right child start
+            let op = if let (Some(ln), Some(rn)) = (left_node, right_node) {
+                let left_end = ln.end_byte();
+                let right_start = rn.start_byte();
+                if right_start > left_end {
+                    source[left_end..right_start]
+                        .iter()
+                        .map(|&b| b as char)
+                        .collect::<String>()
+                        .trim()
+                        .to_string()
+                } else {
+                    String::new()
+                }
             } else {
-                "="
+                String::new()
             };
-            let has_amp = op_text.contains("&");
+            let has_amp = op.contains("&");
             let left_unwrap = left.unwrap_or_else(|| make_none(py));
             let right_unwrap = right.unwrap_or_else(|| make_none(py));
+            if left_kind == "list_literal" {
+                let la = Py::new(
+                    py,
+                    ListAssignment {
+                        lineno: lno,
+                        nodes: left_unwrap,
+                        expr: right_unwrap,
+                    },
+                )?;
+                return Ok(Some(la.into_any()));
+            }
             if op == "=" && !has_amp {
                 let a = Py::new(
                     py,
@@ -300,11 +1032,16 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 )?;
                 Some(a.into_any())
             } else {
+                let final_op = if op.ends_with('=') {
+                    op.clone()
+                } else {
+                    format!("{op}=")
+                };
                 let a = Py::new(
                     py,
                     AssignOp {
                         lineno: lno,
-                        op: make_str(py, &format!("{op}=")),
+                        op: make_str(py, &final_op),
                         left: left_unwrap,
                         right: right_unwrap,
                     },
@@ -314,10 +1051,10 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "binary_expression" => {
             let left = field_child(&node, "left")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let right = field_child(&node, "right")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let mut op = String::new();
             let mut cursor = node.walk();
@@ -350,7 +1087,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 .unwrap_or_default();
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let u = Py::new(
                 py,
@@ -364,15 +1101,15 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "conditional_expression" => {
             let cond = field_child(&node, "condition")
-                .and_then(|n| translate(n, source, py).ok().flatten());
-            let body =
-                field_child(&node, "body").and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
+            let body = field_child(&node, "body")
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let alt = field_child(&node, "alternative")
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let iftrue = body
                 .or_else(|| {
                     field_child(&node, "condition")
-                        .and_then(|n| translate(n, source, py).ok().flatten())
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 })
                 .unwrap_or_else(|| make_none(py));
             let t = Py::new(
@@ -409,7 +1146,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             }
             let expr = node
                 .named_child(node.named_child_count().saturating_sub(1) as u32)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let c = Py::new(
                 py,
@@ -431,7 +1168,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             }
             let var = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             if node.child(0).is_some_and(|c| c.is_named()) {
                 let p = Py::new(
@@ -458,11 +1195,11 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "reference_assignment_expression" => {
             let left = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let right = node
                 .named_child(1)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let a = Py::new(
                 py,
@@ -479,12 +1216,12 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         // ── access / calls ──────────────────────────────────────
         "member_access_expression" => {
             let obj = field_child(&node, "object")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let name_n = field_child(&node, "name");
             let name = if let Some(nn) = name_n {
                 if nn.kind() == "variable_name" || nn.kind() == "variable_variable" {
-                    translate(nn, source, py)?.unwrap_or_else(|| make_none(py))
+                    translate_with_ctx(nn, source, py, ctx)?.unwrap_or_else(|| make_none(py))
                 } else {
                     make_str(py, text_of(&nn, source))
                 }
@@ -502,35 +1239,149 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             Some(op.into_any())
         }
         "subscript_expression" => {
-            let obj = node
-                .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+            let obj_node = node.named_child(0);
+            let obj = obj_node
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
-            let idx = node
-                .named_child(1)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+            let idx_node = node.named_child(1);
+            let idx_is_name = idx_node.is_some_and(|n| {
+                let k = n.kind();
+                k == "name"
+                    || k == "qualified_name"
+                    || k == "fully_qualified_name"
+                    || k == "relative_name"
+            });
+            let idx = idx_node
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
-            let a = Py::new(
-                py,
-                ArrayOffset {
-                    lineno: lno,
-                    node: obj,
-                    expr: idx,
-                },
-            )?;
-            Some(a.into_any())
+            let idx = if idx_is_name {
+                idx.bind(py)
+                    .getattr("name")
+                    .map(|n| n.into())
+                    .unwrap_or(idx)
+            } else {
+                idx
+            };
+            // Check if obj_node is member_access_expression
+            if let Some(on) = obj_node {
+                if on.kind() == "member_access_expression" {
+                    let name_n = field_child(&on, "name");
+                    if let Some(nn) = name_n {
+                        if nn.kind() == "variable_name" {
+                            let obj_part = field_child(&on, "object")
+                                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
+                                .unwrap_or_else(|| make_none(py));
+                            let name_part = translate_with_ctx(nn, source, py, ctx)
+                                .ok()
+                                .and_then(|o| o)
+                                .unwrap_or_else(|| make_none(py));
+                            let new_name = Py::new(
+                                py,
+                                ArrayOffset {
+                                    lineno: lno,
+                                    node: name_part,
+                                    expr: idx.clone_ref(py),
+                                },
+                            )?
+                            .into_any();
+                            let op = Py::new(
+                                py,
+                                ObjectProperty {
+                                    lineno: lno,
+                                    node: obj_part,
+                                    name: new_name,
+                                },
+                            )?;
+                            return Ok(Some(op.into_any()));
+                        }
+                    }
+                }
+            }
+            // Check for { in text → StringOffset
+            let text = text_of(&node, source);
+            if text.contains('{') {
+                let so = Py::new(
+                    py,
+                    StringOffset {
+                        lineno: lno,
+                        node: obj,
+                        expr: idx,
+                    },
+                )?;
+                Some(so.into_any())
+            } else {
+                let a = Py::new(
+                    py,
+                    ArrayOffset {
+                        lineno: lno,
+                        node: obj,
+                        expr: idx,
+                    },
+                )?;
+                Some(a.into_any())
+            }
         }
         "scoped_property_access_expression" => {
             let scope_n = field_child(&node, "scope");
             let scope = scope_n
-                .map(|n| make_str(py, text_of(&n, source)))
+                .map(|n| {
+                    let kind = n.kind();
+                    let txt = text_of(&n, source);
+                    if kind == "variable_name"
+                        || kind == "dynamic_variable_name"
+                        || txt.starts_with('$')
+                    {
+                        if txt.starts_with('$') {
+                            Py::new(
+                                py,
+                                Variable {
+                                    lineno: lno,
+                                    name: make_str(py, txt),
+                                },
+                            )
+                            .map(|v| v.into_any())
+                            .ok()
+                            .unwrap_or_else(|| make_none(py))
+                        } else {
+                            translate_with_ctx(n, source, py, ctx)
+                                .ok()
+                                .and_then(|o| o)
+                                .unwrap_or_else(|| make_none(py))
+                        }
+                    } else {
+                        let lower = txt.to_lowercase();
+                        if lower == "static" || lower == "self" || lower == "parent" {
+                            make_str(py, &lower)
+                        } else {
+                            make_str(py, txt)
+                        }
+                    }
+                })
                 .unwrap_or_else(|| make_str(py, ""));
             let name_n = field_child(&node, "name");
             let name = if let Some(nn) = name_n {
-                if nn.kind() == "variable_name" || nn.kind() == "variable_variable" {
-                    translate(nn, source, py)?.unwrap_or_else(|| make_none(py))
+                let kind = nn.kind();
+                let txt = text_of(&nn, source);
+                if kind == "variable_name" || kind == "variable_variable" || txt.starts_with('$') {
+                    if txt.starts_with('$') || txt.starts_with('{') {
+                        Py::new(
+                            py,
+                            Variable {
+                                lineno: lno,
+                                name: make_str(py, txt),
+                            },
+                        )
+                        .map(|v| v.into_any())
+                        .ok()
+                        .unwrap_or_else(|| make_none(py))
+                    } else {
+                        translate_with_ctx(nn, source, py, ctx)
+                            .ok()
+                            .and_then(|o| o)
+                            .unwrap_or_else(|| make_none(py))
+                    }
                 } else {
-                    make_str(py, text_of(&nn, source))
+                    make_str(py, txt)
                 }
             } else {
                 make_str(py, "")
@@ -548,45 +1399,187 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "class_constant_access_expression" => {
             let scope_n = node.named_child(0);
             let scope = scope_n
-                .map(|n| make_str(py, text_of(&n, source)))
+                .map(|n| {
+                    let kind = n.kind();
+                    let txt = text_of(&n, source);
+                    if kind == "variable_name" || txt.starts_with('$') {
+                        translate_with_ctx(n, source, py, ctx)
+                            .ok()
+                            .and_then(|o| o)
+                            .unwrap_or_else(|| make_none(py))
+                    } else {
+                        let lower = txt.to_lowercase();
+                        if lower == "static" || lower == "self" || lower == "parent" {
+                            make_str(py, &lower)
+                        } else {
+                            make_str(py, txt)
+                        }
+                    }
+                })
                 .unwrap_or_else(|| make_str(py, ""));
             let name_n = node.named_child(1);
-            let name = name_n
-                .map(|n| make_str(py, text_of(&n, source)))
-                .unwrap_or_else(|| make_str(py, ""));
-            let sp = Py::new(
-                py,
-                StaticProperty {
-                    lineno: lno,
-                    node: scope,
-                    name,
-                },
-            )?;
-            Some(sp.into_any())
+            let name_text = name_n
+                .map(|n| text_of(&n, source).to_string())
+                .unwrap_or_default();
+            if name_text == "class" {
+                let scope_text = scope_n
+                    .map(|n| text_of(&n, source).to_string())
+                    .unwrap_or_default();
+                Some(make_str(py, &scope_text))
+            } else {
+                let name = if let Some(nn) = name_n {
+                    if nn.kind() == "name" && nn.named_child_count() > 0 {
+                        let inner = nn.named_child(0).unwrap_or(nn);
+                        if inner.kind() == "variable_name" {
+                            translate_with_ctx(inner, source, py, ctx)
+                                .ok()
+                                .and_then(|o| o)
+                                .unwrap_or_else(|| make_str(py, text_of(&nn, source)))
+                        } else {
+                            make_str(py, text_of(&nn, source))
+                        }
+                    } else {
+                        make_str(py, text_of(&nn, source))
+                    }
+                } else {
+                    make_str(py, "")
+                };
+                let sp = Py::new(
+                    py,
+                    StaticProperty {
+                        lineno: lno,
+                        node: scope,
+                        name,
+                    },
+                )?;
+                Some(sp.into_any())
+            }
         }
         "function_call_expression" => {
             let fn_node = field_child(&node, "function");
-            let args_node = field_child(&node, "arguments");
             let fn_val = fn_node
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
-            let args = args_node
+            let fn_text_opt =
+                fn_node.map(|n| text_of(&n, source).trim().to_lowercase().to_string());
+            let args_node = field_child(&node, "arguments");
+            let args: Py<PyAny> = args_node
                 .map(|a| {
                     let list = PyList::empty(py);
                     let mut cursor = a.walk();
                     for child in a.named_children(&mut cursor) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
                     list.into()
                 })
                 .unwrap_or_else(|| PyList::empty(py).into());
+
+            let args_bound = args.bind(py);
+            let args_list: Option<&Bound<'_, PyList>> = args_bound.cast::<PyList>().ok();
+            let args_len = args_list.map(|l| l.len()).unwrap_or(0);
+
+            match fn_text_opt.as_deref() {
+                Some("die") | Some("exit") => {
+                    let expr = if args_len > 0 {
+                        let first = args_list.unwrap().get_item(0)?;
+                        if let Ok(param) = first.cast::<Parameter>() {
+                            param.borrow().node.clone_ref(py)
+                        } else {
+                            first.into()
+                        }
+                    } else {
+                        make_none(py)
+                    };
+                    let e = Py::new(
+                        py,
+                        Exit {
+                            lineno: lno,
+                            expr,
+                            type_: make_str(py, fn_text_opt.as_deref().unwrap_or("exit")),
+                        },
+                    )?;
+                    return Ok(Some(e.into_any()));
+                }
+                Some("isset") => {
+                    let vars = PyList::empty(py);
+                    if let Some(list) = args_list {
+                        for item in list.iter() {
+                            if let Ok(param) = item.cast::<Parameter>() {
+                                vars.append(param.borrow().node.clone_ref(py))?;
+                            } else {
+                                vars.append(item)?;
+                            }
+                        }
+                    }
+                    let s = Py::new(
+                        py,
+                        IsSet {
+                            lineno: lno,
+                            nodes: vars.into(),
+                        },
+                    )?;
+                    return Ok(Some(s.into_any()));
+                }
+                Some("empty") => {
+                    let expr = if args_len > 0 {
+                        let first = args_list.unwrap().get_item(0)?;
+                        if let Ok(param) = first.cast::<Parameter>() {
+                            param.borrow().node.clone_ref(py)
+                        } else {
+                            first.into()
+                        }
+                    } else {
+                        make_none(py)
+                    };
+                    let e = Py::new(py, Empty { lineno: lno, expr })?;
+                    return Ok(Some(e.into_any()));
+                }
+                Some("eval") => {
+                    let expr = if args_len > 0 {
+                        let first = args_list.unwrap().get_item(0)?;
+                        if let Ok(param) = first.cast::<Parameter>() {
+                            param.borrow().node.clone_ref(py)
+                        } else {
+                            first.into()
+                        }
+                    } else {
+                        make_none(py)
+                    };
+                    let ev = Py::new(py, Eval { lineno: lno, expr })?;
+                    return Ok(Some(ev.into_any()));
+                }
+                _ => {}
+            }
+
+            let fn_is_name = fn_node.is_some_and(|n| {
+                let k = n.kind();
+                k == "name"
+                    || k == "qualified_name"
+                    || k == "fully_qualified_name"
+                    || k == "relative_name"
+            });
+            let fn_name = if fn_val.is_none(py) {
+                fn_node
+                    .map(|n| make_str(py, text_of(&n, source)))
+                    .unwrap_or_else(|| make_none(py))
+            } else if fn_is_name {
+                fn_val
+                    .bind(py)
+                    .getattr("name")
+                    .map(|n| n.into())
+                    .unwrap_or(fn_val)
+            } else {
+                fn_val
+            };
             let fc = Py::new(
                 py,
                 FunctionCall {
                     lineno: lno,
-                    name: fn_val,
+                    name: fn_name,
                     params: args,
                 },
             )?;
@@ -595,12 +1588,28 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "scoped_call_expression" => {
             let scope_n = field_child(&node, "scope");
             let scope = scope_n
-                .map(|n| make_str(py, text_of(&n, source)))
+                .map(|n| {
+                    let kind = n.kind();
+                    if kind == "variable_name" || kind == "dynamic_variable_name" {
+                        translate_with_ctx(n, source, py, ctx)
+                            .ok()
+                            .and_then(|o| o)
+                            .unwrap_or_else(|| make_none(py))
+                    } else {
+                        let txt = text_of(&n, source);
+                        let lower = txt.to_lowercase();
+                        if lower == "static" || lower == "self" || lower == "parent" {
+                            make_str(py, &lower)
+                        } else {
+                            make_str(py, txt)
+                        }
+                    }
+                })
                 .unwrap_or_else(|| make_str(py, ""));
             let name_n = field_child(&node, "name");
             let method_name = if let Some(nn) = name_n {
                 if nn.kind() == "variable_name" || nn.kind() == "variable_variable" {
-                    translate(nn, source, py)?.unwrap_or_else(|| make_none(py))
+                    translate_with_ctx(nn, source, py, ctx)?.unwrap_or_else(|| make_none(py))
                 } else {
                     make_str(py, text_of(&nn, source))
                 }
@@ -613,7 +1622,9 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     let list = PyList::empty(py);
                     let mut cursor = a.walk();
                     for child in a.named_children(&mut cursor) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
@@ -633,12 +1644,12 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "member_call_expression" => {
             let obj = field_child(&node, "object")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let name_n = field_child(&node, "name");
             let name = if let Some(nn) = name_n {
                 if nn.kind() == "variable_name" || nn.kind() == "variable_variable" {
-                    translate(nn, source, py)?.unwrap_or_else(|| make_none(py))
+                    translate_with_ctx(nn, source, py, ctx)?.unwrap_or_else(|| make_none(py))
                 } else {
                     make_str(py, text_of(&nn, source))
                 }
@@ -651,7 +1662,9 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     let list = PyList::empty(py);
                     let mut cursor = a.walk();
                     for child in a.named_children(&mut cursor) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
@@ -671,12 +1684,12 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "nullsafe_member_access_expression" => {
             let obj = field_child(&node, "object")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let name_n = field_child(&node, "name");
             let name = if let Some(nn) = name_n {
                 if nn.kind() == "variable_name" {
-                    translate(nn, source, py)?.unwrap_or_else(|| make_none(py))
+                    translate_with_ctx(nn, source, py, ctx)?.unwrap_or_else(|| make_none(py))
                 } else {
                     make_str(py, text_of(&nn, source))
                 }
@@ -695,7 +1708,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "nullsafe_member_call_expression" => {
             let obj = field_child(&node, "object")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let name_n = field_child(&node, "name");
             let name = name_n
@@ -707,7 +1720,9 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     let list = PyList::empty(py);
                     let mut cursor = a.walk();
                     for child in a.named_children(&mut cursor) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
@@ -741,7 +1756,9 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     let list = PyList::empty(py);
                     let mut cursor2 = a.walk();
                     for child in a.named_children(&mut cursor2) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
@@ -763,7 +1780,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             if let Some(nn) = name_node {
                 let value = node
                     .named_child(node.named_child_count().saturating_sub(1) as u32)
-                    .and_then(|n| translate(n, source, py).ok().flatten())
+                    .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                     .unwrap_or_else(|| make_none(py));
                 let na = Py::new(
                     py,
@@ -777,7 +1794,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             } else {
                 let last = node.named_child(node.named_child_count().saturating_sub(1) as u32);
                 let value = last
-                    .and_then(|n| translate(n, source, py).ok().flatten())
+                    .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                     .unwrap_or_else(|| make_none(py));
                 let has_ref = text_of(&node, source).contains("&");
                 let p = Py::new(
@@ -795,18 +1812,19 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         // ── control flow ─────────────────────────────────────────
         "if_statement" => {
             let cond = field_child(&node, "condition")
-                .and_then(|n| translate(n, source, py).ok().flatten());
-            let body =
-                field_child(&node, "body").and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
+            let body = field_child(&node, "body")
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let elseifs = PyList::empty(py);
             let mut else_node = None;
+            let mut extra_body: Vec<Py<PyAny>> = Vec::new();
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if child.kind() == "else_if_clause" {
                     let e_cond = field_child(&child, "condition")
-                        .and_then(|n| translate(n, source, py).ok().flatten());
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                     let e_body = field_child(&child, "body")
-                        .and_then(|n| translate(n, source, py).ok().flatten());
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                     let ei = Py::new(
                         py,
                         ElseIf {
@@ -818,7 +1836,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     elseifs.append(ei.into_any())?;
                 } else if child.kind() == "else_clause" {
                     let e_body = field_child(&child, "body")
-                        .and_then(|n| translate(n, source, py).ok().flatten());
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                     else_node = Some(
                         Py::new(
                             py,
@@ -829,14 +1847,57 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                         )?
                         .into_any(),
                     );
+                } else if child.kind() == "text_interpolation" {
+                    let res = translate_with_ctx(child, source, py, ctx)?;
+                    extra_body.push(res.unwrap_or_else(|| make_none(py)));
                 }
             }
+            let i_body = if extra_body.is_empty() {
+                body.unwrap_or_else(|| make_none(py))
+            } else {
+                let body_list = PyList::empty(py);
+                if let Some(ref b) = body {
+                    if let Ok(seq) = b.bind(py).cast::<PyList>() {
+                        for k in 0..seq.len() {
+                            body_list.append(seq.get_item(k)?)?;
+                        }
+                    } else {
+                        let cls_name = b
+                            .bind(py)
+                            .getattr("__class__")
+                            .and_then(|c| c.getattr("__name__"))
+                            .and_then(|n| n.extract::<String>())
+                            .unwrap_or_default();
+                        if cls_name == "Block" {
+                            let nodes = b.bind(py).getattr("nodes")?;
+                            if let Ok(seq) = nodes.cast::<PyList>() {
+                                for k in 0..seq.len() {
+                                    body_list.append(seq.get_item(k)?)?;
+                                }
+                            }
+                        } else {
+                            body_list.append(b.clone_ref(py))?;
+                        }
+                    }
+                }
+                for eb in extra_body {
+                    body_list.append(eb)?;
+                }
+                Py::new(
+                    py,
+                    Block {
+                        lineno: None,
+                        nodes: body_list.into(),
+                    },
+                )?
+                .into_any()
+            };
             let i = Py::new(
                 py,
                 If {
                     lineno: lno,
                     expr: cond.unwrap_or_else(|| make_none(py)),
-                    node: body.unwrap_or_else(|| make_none(py)),
+                    node: i_body,
                     elseifs: elseifs.into(),
                     else_: else_node.unwrap_or_else(|| make_none(py)),
                 },
@@ -846,10 +1907,10 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "while_statement" => {
             let cond = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let body = node
                 .named_child(1)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| {
                     let block = Py::new(
                         py,
@@ -875,11 +1936,11 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "do_statement" => {
             let body = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let cond = node
                 .named_child(1)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let dw = Py::new(
                 py,
                 DoWhile {
@@ -893,16 +1954,16 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "for_statement" => {
             let start = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let test = node
                 .named_child(1)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let count = node
                 .named_child(2)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let body = node
                 .named_child(3)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let f = Py::new(
                 py,
@@ -919,13 +1980,13 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "foreach_statement" => {
             let arr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let second = node.named_child(1);
             let (key, val_obj, _is_ref_val) = if let Some(sec) = second {
                 if sec.kind() == "pair" {
                     let k = sec
                         .named_child(0)
-                        .and_then(|n| translate(n, source, py).ok().flatten())
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                         .unwrap_or_else(|| make_none(py));
                     let inner = sec.named_child(1);
                     let (ref_flag, vn) = if let Some(inn) = inner {
@@ -938,7 +1999,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                         (false, None)
                     };
                     let v = vn
-                        .and_then(|n| translate(n, source, py).ok().flatten())
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                         .unwrap_or_else(|| make_none(py));
                     let fv = Py::new(
                         py,
@@ -952,7 +2013,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 } else if sec.kind() == "by_ref" {
                     let vn = sec.named_child(0);
                     let v = vn
-                        .and_then(|n| translate(n, source, py).ok().flatten())
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                         .unwrap_or_else(|| make_none(py));
                     let fv = Py::new(
                         py,
@@ -964,7 +2025,8 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     )?;
                     (None, fv.into_any(), true)
                 } else {
-                    let v = translate(sec, source, py)?.unwrap_or_else(|| make_none(py));
+                    let v =
+                        translate_with_ctx(sec, source, py, ctx)?.unwrap_or_else(|| make_none(py));
                     let fv = Py::new(
                         py,
                         ForeachVariable {
@@ -980,7 +2042,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             };
             let body_node = node
                 .named_child(2)
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
             let fe = Py::new(
                 py,
@@ -997,10 +2059,10 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "switch_statement" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let switch_block = node.named_child(1);
             let cases = switch_block
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| PyList::empty(py).into());
             let sw = Py::new(
                 py,
@@ -1016,7 +2078,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let list = PyList::empty(py);
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     list.append(obj)?;
                 }
             }
@@ -1031,7 +2093,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     first_expr = false;
                     continue;
                 }
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     if let Ok(seq) = obj.cast_bound::<PyList>(py) {
                         for i in 0..seq.len() {
                             body_nodes.append(seq.get_item(i)?)?;
@@ -1044,7 +2106,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             if kind == "case_statement" {
                 let expr_n = field_child(&node, "value");
                 let expr = expr_n
-                    .and_then(|n| translate(n, source, py).ok().flatten())
+                    .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                     .unwrap_or_else(|| make_none(py));
                 let c = Py::new(
                     py,
@@ -1068,10 +2130,10 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "match_expression" => {
             let cond = field_child(&node, "condition")
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let body_node = field_child(&node, "body");
             let arms = body_node
-                .and_then(|n| translate(n, source, py).ok().flatten())
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| PyList::empty(py).into());
             let m = Py::new(
                 py,
@@ -1087,7 +2149,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let list = PyList::empty(py);
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     list.append(obj)?;
                 }
             }
@@ -1099,7 +2161,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 let items = PyList::empty(py);
                 let mut cursor = cn.walk();
                 for child in cn.named_children(&mut cursor) {
-                    if let Some(obj) = translate(child, source, py)? {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                         items.append(obj)?;
                     }
                 }
@@ -1112,7 +2174,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 make_none(py)
             };
             let body = field_child(&node, "return_expression")
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let ma = Py::new(
                 py,
                 MatchArm {
@@ -1125,7 +2187,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "match_default_expression" => {
             let body = field_child(&node, "return_expression")
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let ma = Py::new(
                 py,
                 MatchArm {
@@ -1141,7 +2203,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "return_statement" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let r = Py::new(
                 py,
                 ReturnNode {
@@ -1154,7 +2216,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "break_statement" => {
             let depth = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let b = Py::new(
                 py,
                 BreakNode {
@@ -1167,7 +2229,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "continue_statement" => {
             let depth = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let c = Py::new(
                 py,
                 ContinueNode {
@@ -1180,7 +2242,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "throw_expression" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let t = Py::new(
                 py,
                 Throw {
@@ -1197,7 +2259,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 if child.kind() == "yield" {
                     continue;
                 }
-                expr = translate(child, source, py).ok().flatten();
+                expr = translate_with_ctx(child, source, py, ctx).ok().flatten();
                 break;
             }
             let y = Py::new(
@@ -1213,7 +2275,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let mut arg = None;
             let mut cursor = node.walk();
             if let Some(child) = node.named_children(&mut cursor).next() {
-                arg = translate(child, source, py).ok().flatten();
+                arg = translate_with_ctx(child, source, py, ctx).ok().flatten();
             }
             let et = if text_of(&node, source).to_lowercase().contains("exit") {
                 "exit"
@@ -1233,7 +2295,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "print_intrinsic" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let p = Py::new(
                 py,
                 Print {
@@ -1246,7 +2308,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         "clone_expression" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let c = Py::new(
                 py,
                 CloneNode {
@@ -1260,7 +2322,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let vars = PyList::empty(py);
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     vars.append(obj)?;
                 }
             }
@@ -1273,11 +2335,13 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             )?;
             Some(u.into_any())
         }
-        "parenthesized_expression" => translate(node.named_child(0).unwrap_or(node), source, py)?,
+        "parenthesized_expression" => {
+            translate_with_ctx(node.named_child(0).unwrap_or(node), source, py, ctx)?
+        }
         "error_suppression_expression" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let s = Py::new(
                 py,
                 Silence {
@@ -1295,7 +2359,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         | "require_once_expression" => {
             let expr = node
                 .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let once = kind.contains("once");
             if kind.starts_with("include") {
                 let i = Py::new(
@@ -1319,7 +2383,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 Some(r.into_any())
             }
         }
-        "echo_statement" | "echo_stdout" => translate_echo(node, source, py)?,
+        "echo_statement" | "echo_stdout" => translate_echo(node, source, py, ctx)?,
         "global_statement" | "global_declaration" => {
             let vars = PyList::empty(py);
             let mut cursor = node.walk();
@@ -1328,7 +2392,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 if t == "global" {
                     continue;
                 }
-                if let Some(obj) = translate(child, source, py)? {
+                if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     vars.append(obj)?;
                 }
             }
@@ -1356,7 +2420,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 let value = if nc > 1 {
                     child
                         .named_child(1)
-                        .and_then(|n| translate(n, source, py).ok().flatten())
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 } else {
                     None
                 };
@@ -1390,7 +2454,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     let dname = parts.first().map(|s| s.trim()).unwrap_or("");
                     let dvalue = child
                         .named_child(0)
-                        .and_then(|n| translate(n, source, py).ok().flatten());
+                        .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                     let d = Py::new(
                         py,
                         Directive {
@@ -1402,14 +2466,41 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                         },
                     )?;
                     directives.append(d.into_any())?;
-                } else if let Some(obj) = translate(child, source, py)? {
+                } else if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                     body_nodes.append(obj)?;
                 }
             }
             let body = if body_nodes.is_empty() {
                 make_none(py)
+            } else if body_nodes.len() == 1 {
+                let item: Py<PyAny> = body_nodes.get_item(0)?.into();
+                let cls_name = item
+                    .bind(py)
+                    .getattr("__class__")
+                    .and_then(|c| c.getattr("__name__"))
+                    .and_then(|n| n.extract::<String>())
+                    .unwrap_or_default();
+                if cls_name == "Block" {
+                    item
+                } else {
+                    let block = Py::new(
+                        py,
+                        Block {
+                            lineno: lno,
+                            nodes: body_nodes.into(),
+                        },
+                    )?;
+                    block.into_any()
+                }
             } else {
-                body_nodes.into()
+                let block = Py::new(
+                    py,
+                    Block {
+                        lineno: lno,
+                        nodes: body_nodes.into(),
+                    },
+                )?;
+                block.into_any()
             };
             let dec = Py::new(
                 py,
@@ -1426,7 +2517,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "namespace_use_clause" {
-                    if let Some(obj) = translate(child, source, py)? {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                         decls.append(obj)?;
                     }
                 }
@@ -1451,7 +2542,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     let mut cursor2 = child.walk();
                     for sub in child.named_children(&mut cursor2) {
                         if sub.kind() == "use_as_clause" {
-                            if let Some(obj) = translate(sub, source, py)? {
+                            if let Some(obj) = translate_with_ctx(sub, source, py, ctx)? {
                                 modifiers.append(obj)?;
                             }
                         }
@@ -1470,9 +2561,28 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "use_as_clause" => {
             let _named_count = node.named_child_count();
-            let original = node
-                .named_child(0)
-                .and_then(|n| translate(n, source, py).ok().flatten());
+            let original_child = node.named_child(0);
+            let original = if let Some(n) = original_child {
+                let kind = n.kind();
+                let txt = text_of(&n, source);
+                if kind == "scoped_property_access_expression" || kind == "scoped_call_expression" {
+                    translate_with_ctx(n, source, py, ctx)?.unwrap_or_else(|| make_none(py))
+                } else if let Some(pos) = txt.find("::") {
+                    let sp = Py::new(
+                        py,
+                        StaticProperty {
+                            lineno: lno,
+                            node: make_str(py, &txt[..pos]),
+                            name: make_str(py, &txt[pos + 2..]),
+                        },
+                    )?;
+                    sp.into_any()
+                } else {
+                    make_str(py, txt)
+                }
+            } else {
+                make_none(py)
+            };
             let mut alias = None;
             let mut visibility = None;
             let mut cursor = node.walk();
@@ -1487,7 +2597,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 py,
                 TraitModifier {
                     lineno: lno,
-                    from: original.unwrap_or_else(|| make_none(py)),
+                    from: original,
                     to: alias
                         .map(|a| make_str(py, &a))
                         .unwrap_or_else(|| make_none(py)),
@@ -1503,7 +2613,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if child.kind() == "use_as_clause" {
-                    if let Some(obj) = translate(child, source, py)? {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                         list.append(obj)?;
                     }
                 }
@@ -1533,22 +2643,30 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let name = field_child(&node, "name")
                 .map(|n| make_str(py, text_of(&n, source)))
                 .unwrap_or_else(|| make_str(py, ""));
+            let fn_name_str = name.bind(py).extract::<String>().unwrap_or_default();
+            let old_fn = ctx.function.clone();
+            let full_name = ctx.qualify_name(&fn_name_str);
+            ctx.function = Some(full_name);
             let params_node = field_child(&node, "parameters");
             let params = params_node
                 .map(|pn| {
                     let list = PyList::empty(py);
                     let mut cursor = pn.walk();
                     for child in pn.named_children(&mut cursor) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
                     list.into()
                 })
                 .unwrap_or_else(|| PyList::empty(py).into());
-            let body = field_child(&node, "body")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+            let body_block = field_child(&node, "body")
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
+            let body = unwrap_block_body(py, body_block);
+            ctx.function = old_fn;
             let return_type_node = field_child(&node, "return_type");
             let return_type = return_type_node
                 .map(|n| make_str(py, text_of(&n, source)))
@@ -1578,7 +2696,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 } else if child.kind() == "formal_parameters" {
                     let mut c2 = child.walk();
                     for p in child.named_children(&mut c2) {
-                        if let Some(obj) = translate(p, source, py)? {
+                        if let Some(obj) = translate_with_ctx(p, source, py, ctx)? {
                             params.append(obj)?;
                         }
                     }
@@ -1612,9 +2730,14 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                         }
                     }
                 } else if child.kind() == "compound_statement" {
-                    if let Some(bres) = translate(child, source, py)? {
-                        body_stmts = PyList::empty(py);
-                        body_stmts.append(bres)?;
+                    if let Some(bres) = translate_with_ctx(child, source, py, ctx)? {
+                        let unwrapped = unwrap_block_body(py, bres);
+                        if let Ok(list) = unwrapped.bind(py).cast::<PyList>() {
+                            body_stmts = list.clone();
+                        } else {
+                            body_stmts = PyList::empty(py);
+                            body_stmts.append(unwrapped)?;
+                        }
                     }
                 }
             }
@@ -1638,12 +2761,12 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let name = name_node
                 .map(|n| make_str(py, text_of(&n, source)))
                 .unwrap_or_else(|| make_str(py, ""));
-            let default_val = default_node.and_then(|n| translate(n, source, py).ok().flatten());
-            let has_ref = text_of(&node, source).contains("&")
-                || (0..node.child_count()).any(|i| {
-                    node.child(i as u32)
-                        .is_some_and(|c| c.kind() == "reference_modifier")
-                });
+            let default_val =
+                default_node.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
+            let has_ref = (0..node.child_count()).any(|i| {
+                node.child(i as u32)
+                    .is_some_and(|c| c.kind() == "reference_modifier")
+            });
             let fp = Py::new(
                 py,
                 FormalParameter {
@@ -1658,24 +2781,24 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         }
         "property_promotion_parameter" => {
             let modifiers = PyList::empty(py);
-            let mut type_name: Option<Py<PyAny>> = None;
+            let type_node = field_child(&node, "type");
+            let type_name = type_node.map(|n| make_str(py, text_of(&n, source)));
             let mut name = String::new();
             let default_val: Option<Py<PyAny>>;
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                if child.kind() == "visibility_modifier" {
+                let kind = child.kind();
+                if kind == "visibility_modifier" {
                     modifiers
                         .append(make_str(py, text_of(&child, source).trim()))
                         .ok();
-                } else if child.kind() == "name" {
-                    // type
-                    type_name = Some(make_str(py, text_of(&child, source)));
-                } else if child.kind() == "variable_name" {
+                } else if kind == "variable_name" {
                     name = text_of(&child, source).to_string();
                 }
             }
             let def_node = field_child(&node, "default_value");
-            default_val = def_node.and_then(|n| translate(n, source, py).ok().flatten());
+            default_val =
+                def_node.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let cp = Py::new(
                 py,
                 ConstructorParameter {
@@ -1713,22 +2836,38 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let name = field_child(&node, "name")
                 .map(|n| make_str(py, text_of(&n, source)))
                 .unwrap_or_else(|| make_str(py, ""));
+            let method_name_str = name.bind(py).extract::<String>().unwrap_or_default();
+            let old_method = ctx.method.clone();
+            let old_fn = ctx.function.clone();
+            if let Some(ref cls) = ctx.class_ {
+                ctx.method = Some(format!("{}::{}", cls, method_name_str));
+                ctx.function = Some(format!("{}::{}", cls, method_name_str));
+            }
             let params_node = field_child(&node, "parameters");
             let params = params_node
                 .map(|pn| {
                     let list = PyList::empty(py);
                     let mut c = pn.walk();
                     for child in pn.named_children(&mut c) {
-                        if let Some(obj) = translate(child, source, py).unwrap_or(None) {
+                        if let Some(obj) =
+                            translate_with_ctx(child, source, py, ctx).unwrap_or(None)
+                        {
                             list.append(obj).ok();
                         }
                     }
                     list.into()
                 })
                 .unwrap_or_else(|| PyList::empty(py).into());
-            let body = field_child(&node, "body")
-                .and_then(|n| translate(n, source, py).ok().flatten())
+            let body_block = field_child(&node, "body")
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
                 .unwrap_or_else(|| make_none(py));
+            let body = unwrap_block_body(py, body_block);
+            // If body is None but method expects empty list, return empty list
+            let body = if body.bind(py).is_none() {
+                PyList::empty(py).into()
+            } else {
+                body
+            };
             let m = Py::new(
                 py,
                 Method {
@@ -1740,12 +2879,17 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     is_ref: make_bool(py, false),
                 },
             )?;
+            ctx.method = old_method;
+            ctx.function = old_fn;
             Some(m.into_any())
         }
         "class_declaration" => {
             let name = field_child(&node, "name")
                 .map(|n| make_str(py, text_of(&n, source)))
                 .unwrap_or_else(|| make_str(py, ""));
+            let class_name_str = name.bind(py).extract::<String>().unwrap_or_default();
+            let old_class = ctx.class_.clone();
+            ctx.class_ = Some(ctx.qualify_name(&class_name_str));
             let mods = PyList::empty(py);
             let mut base_name: Option<Py<PyAny>> = None;
             let interfaces = PyList::empty(py);
@@ -1796,9 +2940,9 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                                     .map(|n| make_str(py, text_of(&n, source)))
                                     .unwrap_or_else(|| make_str(py, ""));
                                 let val = if elem_node.named_child_count() > 1 {
-                                    elem_node
-                                        .named_child(1)
-                                        .and_then(|n| translate(n, source, py).ok().flatten())
+                                    elem_node.named_child(1).and_then(|n| {
+                                        translate_with_ctx(n, source, py, ctx).ok().flatten()
+                                    })
                                 } else {
                                     None
                                 };
@@ -1824,10 +2968,10 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                             body.append(ccs.into_any())?;
                         }
                     } else if child.kind() == "use_declaration" {
-                        if let Some(res) = translate(child, source, py)? {
+                        if let Some(res) = translate_with_ctx(child, source, py, ctx)? {
                             uses.append(res)?;
                         }
-                    } else if let Some(res) = translate(child, source, py)? {
+                    } else if let Some(res) = translate_with_ctx(child, source, py, ctx)? {
                         if let Ok(seq) = res.cast_bound::<PyList>(py) {
                             for i in 0..seq.len() {
                                 body.append(seq.get_item(i)?)?;
@@ -1855,6 +2999,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     nodes: body.into(),
                 },
             )?;
+            ctx.class_ = old_class;
             Some(c_decl.into_any())
         }
         "trait_declaration" => {
@@ -1871,10 +3016,10 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                         continue;
                     }
                     if child.kind() == "use_declaration" {
-                        if let Some(res) = translate(child, source, py)? {
+                        if let Some(res) = translate_with_ctx(child, source, py, ctx)? {
                             uses.append(res)?;
                         }
-                    } else if let Some(res) = translate(child, source, py)? {
+                    } else if let Some(res) = translate_with_ctx(child, source, py, ctx)? {
                         if let Ok(seq) = res.cast_bound::<PyList>(py) {
                             for i in 0..seq.len() {
                                 body.append(seq.get_item(i)?)?;
@@ -1927,7 +3072,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     if child.kind() == "{" || child.kind() == "}" || child.kind() == ";" {
                         continue;
                     }
-                    if let Some(res) = translate(child, source, py)? {
+                    if let Some(res) = translate_with_ctx(child, source, py, ctx)? {
                         if let Ok(seq) = res.cast_bound::<PyList>(py) {
                             for i in 0..seq.len() {
                                 body.append(seq.get_item(i)?)?;
@@ -1956,7 +3101,8 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                 let name_node = field_child(&child, "name");
                 let value_node = field_child(&child, "value");
                 let nm = name_node.map(|n| make_str(py, text_of(&n, source)));
-                let val = value_node.and_then(|n| translate(n, source, py).ok().flatten());
+                let val =
+                    value_node.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                 let sv = Py::new(
                     py,
                     StaticVariable {
@@ -1997,7 +3143,8 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                         let name_n = field_child(&child, "name");
                         let val_n = field_child(&child, "default_value");
                         let nm = name_n.map(|n| make_str(py, text_of(&n, source)));
-                        let val = val_n.and_then(|n| translate(n, source, py).ok().flatten());
+                        let val = val_n
+                            .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
                         let cv = Py::new(
                             py,
                             ClassVariable {
@@ -2025,14 +3172,8 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let body_n = field_child(&node, "body");
             let body_items = PyList::empty(py);
             if let Some(bn) = body_n {
-                if let Some(obj) = translate(bn, source, py)? {
-                    if let Ok(seq) = obj.cast_bound::<PyList>(py) {
-                        for i in 0..seq.len() {
-                            body_items.append(seq.get_item(i)?)?;
-                        }
-                    } else {
-                        body_items.append(obj)?;
-                    }
+                if let Some(obj) = translate_with_ctx(bn, source, py, ctx)? {
+                    append_unwrapped(py, &body_items, obj)?;
                 }
             }
             let catches = PyList::empty(py);
@@ -2040,11 +3181,11 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "catch_clause" {
-                    if let Some(obj) = translate(child, source, py)? {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                         catches.append(obj)?;
                     }
                 } else if child.kind() == "finally_clause" {
-                    if let Some(obj) = translate(child, source, py)? {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                         finally_block = Some(obj);
                     }
                 }
@@ -2064,19 +3205,13 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let type_name = field_child(&node, "type")
                 .map(|n| make_str(py, text_of(&n, source)))
                 .unwrap_or_else(|| make_str(py, ""));
-            let var =
-                field_child(&node, "name").and_then(|n| translate(n, source, py).ok().flatten());
+            let var = field_child(&node, "name")
+                .and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten());
             let body_n = field_child(&node, "body");
             let body = PyList::empty(py);
             if let Some(bn) = body_n {
-                if let Some(obj) = translate(bn, source, py)? {
-                    if let Ok(seq) = obj.cast_bound::<PyList>(py) {
-                        for i in 0..seq.len() {
-                            body.append(seq.get_item(i)?)?;
-                        }
-                    } else {
-                        body.append(obj)?;
-                    }
+                if let Some(obj) = translate_with_ctx(bn, source, py, ctx)? {
+                    append_unwrapped(py, &body, obj)?;
                 }
             }
             let c = Py::new(
@@ -2094,14 +3229,8 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
             let body_n = field_child(&node, "body");
             let body = PyList::empty(py);
             if let Some(bn) = body_n {
-                if let Some(obj) = translate(bn, source, py)? {
-                    if let Ok(seq) = obj.cast_bound::<PyList>(py) {
-                        for i in 0..seq.len() {
-                            body.append(seq.get_item(i)?)?;
-                        }
-                    } else {
-                        body.append(obj)?;
-                    }
+                if let Some(obj) = translate_with_ctx(bn, source, py, ctx)? {
+                    append_unwrapped(py, &body, obj)?;
                 }
             }
             let f = Py::new(
@@ -2117,26 +3246,42 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         // ── text / shell ─────────────────────────────────────────
         "text_interpolation" => {
             let txt = text_of(&node, source);
-            if txt.is_empty() {
+            let cleaned = txt
+                .trim()
+                .trim_start_matches("?>")
+                .trim_end_matches("?>")
+                .trim_start_matches("<?=")
+                .trim_end_matches("<?=")
+                .trim_start_matches("<?php")
+                .trim_end_matches("<?php")
+                .trim_start_matches("<?")
+                .trim_end_matches("<?")
+                .trim();
+            if cleaned.is_empty()
+                || cleaned == "?>"
+                || cleaned == "<?php"
+                || cleaned == "<?="
+                || cleaned == "<?"
+            {
                 None
             } else {
                 let ih = Py::new(
                     py,
                     InlineHTML {
                         lineno: lno,
-                        data: make_str(py, txt),
+                        data: make_str(py, cleaned),
                     },
                 )?;
                 Some(ih.into_any())
             }
         }
         "shell_command_expression" => {
-            let txt = text_of(&node, source);
+            let shell_arg = process_encapsed_parts(&node, source, py, true, ctx)?;
             let p = Py::new(
                 py,
                 Parameter {
                     lineno: lno,
-                    node: make_str(py, txt),
+                    node: shell_arg,
                     is_ref: make_bool(py, false),
                 },
             )?;
@@ -2156,23 +3301,67 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
         // ── dynamic variable ────────────────────────────────────
         "dynamic_variable_name" => {
             let inner = node.named_child(0);
-            let name = if let Some(inr) = inner {
+            let result: Option<Py<PyAny>> = if let Some(inr) = inner {
                 if inr.kind() == "name" {
-                    make_str(py, &format!("${}", text_of(&inr, source)))
+                    let v = Py::new(
+                        py,
+                        Variable {
+                            lineno: lno,
+                            name: make_str(py, &format!("${}", text_of(&inr, source))),
+                        },
+                    )?;
+                    Some(v.into_any())
+                } else if inr.kind() == "dynamic_variable_name" {
+                    let inner_val =
+                        translate_with_ctx(inr, source, py, ctx)?.unwrap_or_else(|| make_none(py));
+                    let v = Py::new(
+                        py,
+                        Variable {
+                            lineno: lno,
+                            name: inner_val,
+                        },
+                    )?;
+                    Some(v.into_any())
                 } else if inr.kind() == "variable_name" {
-                    translate(inr, source, py)?.unwrap_or_else(|| make_none(py))
+                    let inner_res =
+                        translate_with_ctx(inr, source, py, ctx)?.unwrap_or_else(|| make_none(py));
+                    if ctx.string_mode {
+                        Some(inner_res)
+                    } else {
+                        let v = Py::new(
+                            py,
+                            Variable {
+                                lineno: lno,
+                                name: inner_res,
+                            },
+                        )?;
+                        Some(v.into_any())
+                    }
                 } else {
-                    translate(inr, source, py)?.unwrap_or_else(|| make_none(py))
+                    // Other inner types: use dv_translate
+                    let inner_res =
+                        dv_translate(inr, source, py, ctx)?.unwrap_or_else(|| make_none(py));
+                    if ctx.string_mode {
+                        Some(inner_res)
+                    } else {
+                        let v = Py::new(
+                            py,
+                            Variable {
+                                lineno: lno,
+                                name: inner_res,
+                            },
+                        )?;
+                        Some(v.into_any())
+                    }
                 }
             } else {
-                make_none(py)
+                None
             };
-            let v = Py::new(py, Variable { lineno: lno, name })?;
-            Some(v.into_any())
+            result
         }
         "array_element_initializer" => {
             let last = node.named_child(node.named_child_count().saturating_sub(1) as u32);
-            last.and_then(|n| translate(n, source, py).ok().flatten())
+            last.and_then(|n| translate_with_ctx(n, source, py, ctx).ok().flatten())
         }
 
         // ── fallback ─────────────────────────────────────────────
@@ -2184,7 +3373,7 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
                     if is_skip(child.kind()) {
                         continue;
                     }
-                    if let Some(obj) = translate(child, source, py)? {
+                    if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
                         list.append(obj)?;
                     }
                 }
@@ -2202,14 +3391,19 @@ fn translate(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<Py
     Ok(result)
 }
 
-fn translate_echo(node: Node, source: &[u8], py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+fn translate_echo(
+    node: Node,
+    source: &[u8],
+    py: Python<'_>,
+    ctx: &mut Ctx,
+) -> PyResult<Option<Py<PyAny>>> {
     let items = PyList::empty(py);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "echo" {
             continue;
         }
-        if let Some(obj) = translate(child, source, py)? {
+        if let Some(obj) = translate_with_ctx(child, source, py, ctx)? {
             items.append(obj)?;
         }
     }

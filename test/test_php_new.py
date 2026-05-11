@@ -1,9 +1,6 @@
-"""Tests for PHP 5.4+ / 7.x / 8.x syntax that phply does not support.
+"""Tests for PHP 5.4+ / 7.x / 8.x syntax that phply does not support."""
 
-Always uses native ``bashe.types`` regardless of whether phply is installed.
-"""
-
-from bashe.types import (
+from bashe import (
     Array,
     ArrayElement,
     ArrayOffset,
@@ -30,6 +27,7 @@ from bashe.types import (
     TraitUse,
     Variable,
 )
+
 from test.util import eq_ast
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -70,7 +68,7 @@ $obj->hello();
         Assignment(Variable("$obj"), New("World", []), False),
         MethodCall(Variable("$obj"), "hello", []),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -97,7 +95,7 @@ function add(int $a, int $b): int {
             "int",
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php7_null_coalesce():
@@ -112,7 +110,7 @@ $name = $_GET["user"] ?? 'Guest';
             False,
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php7_spaceship():
@@ -123,7 +121,7 @@ $result = 1 <=> 2;
     expected = [
         Assignment(Variable("$result"), BinaryOp("<=>", 1, 2), False),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -162,7 +160,7 @@ class User {
             ],
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php8_named_arguments():
@@ -177,7 +175,7 @@ $user = new User(age: 25, name: "Alice");
             False,
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php8_nullsafe():
@@ -196,7 +194,7 @@ $city = $user?->address?->getCity();
             False,
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php8_match_expression():
@@ -220,7 +218,7 @@ echo match($user->name) {
             ]
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -250,7 +248,7 @@ class User {
             ],
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php81_intersection_type():
@@ -269,7 +267,7 @@ function process(Countable&Iterator $input): void {}
             "void",
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -299,7 +297,7 @@ readonly class Config {
             ],
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)
 
 
 def test_php82_dnf_type():
@@ -318,4 +316,4 @@ function handle((Countable&Iterator)|null $data): void {}
             "void",
         ),
     ]
-    eq_ast(input, expected, legacy=False)
+    eq_ast(input, expected)

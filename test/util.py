@@ -1,22 +1,12 @@
 """Shared test utilities."""
 
-from bashe.parser import Bashe
+from bashe import Bashe
 
-try:
-    import phply  # noqa: F401
-
-    _LEGACY = True
-except ImportError:
-    _LEGACY = False
-
-parser = Bashe(legacy=_LEGACY)
+parser = Bashe()
 
 
-def eq_ast(input, expected, filename=None, with_top_lineno=False, legacy=None):
-    if legacy is None:
-        bashe = parser
-    else:
-        bashe = Bashe(legacy=legacy)
+def eq_ast(input, expected, filename=None, with_top_lineno=False):
+    bashe = parser
     output = bashe.parse(input, filename)
 
     diff = None

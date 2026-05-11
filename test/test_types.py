@@ -1,6 +1,6 @@
 """Tests for bashe.types.Node - accept() and generic()."""
 
-from bashe.types import (
+from bashe import (
     Array,
     ArrayElement,
     Assignment,

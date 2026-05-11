@@ -1,10 +1,9 @@
 import timeit
 from pathlib import Path
 
+from bashe import Bashe
 from phply import phplex  # noqa: F401
 from phply.phpparse import make_parser  # noqa: F401
-
-from bashe import Bashe
 
 in_text = Path("bench.php").read_text()
 

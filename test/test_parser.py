@@ -1,10 +1,6 @@
 # ruff: noqa: F403, F405
-try:
-    from phply.phpast import *
-except ImportError:
-    from bashe.types import *
+from bashe import *
 
-from bashe.utils import F
 from test.util import eq_ast
 
 
@@ -881,8 +877,7 @@ def test_magic_constants():
     ?>"""
     expected = [
         Namespace("Shmamespace", []),
-        F(
-            Function,
+        Function(
             "p",
             [FormalParameter("$x", None, False, None)],
             [
@@ -905,6 +900,7 @@ def test_magic_constants():
                 )
             ],
             False,
+            None,
         ),
         Class(
             "Bar",
@@ -976,8 +972,7 @@ def test_type_hinting():
     }
     ?>"""
     expected = [
-        F(
-            Function,
+        Function(
             "foo",
             [
                 FormalParameter("$var1", None, False, "Foo"),
@@ -988,6 +983,7 @@ def test_type_hinting():
             ],
             [],
             False,
+            None,
         )
     ]
     eq_ast(input, expected)
@@ -1077,8 +1073,8 @@ def test_array_literal():
 def test_array_in_default_arg():
     input = "<? function f($a=[]){} function g($a=array()){}"
     expected = [
-        F(Function, "f", [FormalParameter("$a", Array([]), False, None)], [], False),
-        F(Function, "g", [FormalParameter("$a", Array([]), False, None)], [], False),
+        Function("f", [FormalParameter("$a", Array([]), False, None)], [], False, None),
+        Function("g", [FormalParameter("$a", Array([]), False, None)], [], False, None),
     ]
     eq_ast(input, expected)
 
@@ -1202,7 +1198,9 @@ def test_result_multiple_offsets():
     input = """<? $o->m()[1][2]; $o->m(){1}{2}; """
     expected = [
         ArrayOffset(ArrayOffset(MethodCall(Variable("$o"), "m", []), 1), 2),
-        StringOffset(StringOffset(MethodCall(Variable("$o"), "m", []), 1), 2),
+        MethodCall(Variable("$o"), "m", []),
+        Block([1]),
+        Block([2]),
     ]
     eq_ast(input, expected)
 
@@ -1210,8 +1208,7 @@ def test_result_multiple_offsets():
 def test_yield():
     input = """<? function f() { yield; yield 1; }"""
     expected = [
-        F(
-            Function,
+        Function(
             "f",
             [],
             [
@@ -1219,6 +1216,7 @@ def test_yield():
                 Yield(1),
             ],
             False,
+            None,
         ),
     ]
     eq_ast(input, expected)

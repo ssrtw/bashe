@@ -1,4 +1,10 @@
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+
+macro_rules! field_name_str {
+    (type_) => { "type" };
+    ($f:ident) => { stringify!($f) };
+}
 
 macro_rules! ast_node {
     ($pyname:literal, $name:ident { $($field:ident),* $(,)? }) => {
@@ -11,6 +17,7 @@ macro_rules! ast_node {
         #[pymethods]
         impl $name {
             #[new]
+            #[pyo3(signature = ($($field,)* lineno=None))]
             fn py_new(
                 $($field: Py<PyAny>,)*
                 lineno: Option<usize>,
@@ -20,7 +27,7 @@ macro_rules! ast_node {
 
             #[classattr]
             fn fields() -> Vec<&'static str> {
-                vec![$(stringify!($field)),*]
+                vec![$(field_name_str!($field)),*]
             }
 
             fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
@@ -31,6 +38,83 @@ macro_rules! ast_node {
                     fields.push(v.repr()?.to_string());
                 )*
                 Ok(format!("{}({})", $pyname, fields.join(", ")))
+            }
+
+            fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+                let py = slf.py();
+                let rhs = match other.cast::<Self>() {
+                    Ok(r) => r,
+                    Err(_) => return Ok(false),
+                };
+                let this = slf.borrow();
+                let rhs = rhs.borrow();
+                $(
+                    if !this.$field.bind(py).eq(rhs.$field.bind(py))? {
+                        return Ok(false);
+                    }
+                )*
+                Ok(true)
+            }
+
+            fn __ne__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+                Ok(!Self::__eq__(slf, other)?)
+            }
+
+            fn accept(slf: &Bound<'_, Self>, visitor: &Bound<'_, PyAny>) -> PyResult<()> {
+                let py = slf.py();
+                let this = slf.borrow();
+                visitor.call1((slf.clone(),))?;
+                $(
+                    let val = this.$field.bind(py);
+                    if val.hasattr("accept")? {
+                        val.call_method1("accept", (visitor,))?;
+                    } else if let Ok(list) = val.cast::<PyList>() {
+                        for item in list.iter() {
+                            if item.hasattr("accept")? {
+                                item.call_method1("accept", (visitor,))?;
+                            }
+                        }
+                    }
+                )*
+                Ok(())
+            }
+
+            #[pyo3(signature = (with_lineno=None))]
+            fn generic(slf: &Bound<'_, Self>, with_lineno: Option<bool>) -> PyResult<Py<PyAny>> {
+                let py = slf.py();
+                let this = slf.borrow();
+                let dict = PyDict::new(py);
+                if with_lineno.unwrap_or(false) {
+                    if let Some(l) = this.lineno {
+                        dict.set_item("lineno", l)?;
+                    }
+                }
+                $(
+                    let val = this.$field.bind(py);
+                    if val.hasattr("generic")? {
+                        let gen = val.call_method1("generic", (with_lineno,))?;
+                        dict.set_item(field_name_str!($field), gen)?;
+                    } else if let Ok(list) = val.cast::<PyList>() {
+                        let new_list = PyList::empty(py);
+                        for item in list.iter() {
+                            if item.hasattr("generic")? {
+                                let gen = item.call_method1("generic", (with_lineno,))?;
+                                new_list.append(gen)?;
+                            } else {
+                                new_list.append(item)?;
+                            }
+                        }
+                        dict.set_item(field_name_str!($field), new_list)?;
+                    } else {
+                        dict.set_item(field_name_str!($field), val)?;
+                    }
+                )*
+                let class_name = PyString::new(py, $pyname);
+                let items: Vec<Py<PyAny>> = vec![
+                    class_name.into_any().unbind(),
+                    dict.unbind().into(),
+                ];
+                Ok(PyTuple::new(py, items)?.into_any().unbind())
             }
         }
     };
@@ -261,3 +345,92 @@ ast_node!(
         default
     }
 );
+
+pub fn register_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<InlineHTML>()?;
+    m.add_class::<Block>()?;
+    m.add_class::<Namespace>()?;
+    m.add_class::<Assignment>()?;
+    m.add_class::<ListAssignment>()?;
+    m.add_class::<New>()?;
+    m.add_class::<CloneNode>()?;
+    m.add_class::<BreakNode>()?;
+    m.add_class::<ContinueNode>()?;
+    m.add_class::<ReturnNode>()?;
+    m.add_class::<YieldNode>()?;
+    m.add_class::<Global>()?;
+    m.add_class::<Static>()?;
+    m.add_class::<Echo>()?;
+    m.add_class::<Print>()?;
+    m.add_class::<Unset>()?;
+    m.add_class::<TryNode>()?;
+    m.add_class::<CatchNode>()?;
+    m.add_class::<FinallyNode>()?;
+    m.add_class::<Throw>()?;
+    m.add_class::<Declare>()?;
+    m.add_class::<Directive>()?;
+    m.add_class::<Function>()?;
+    m.add_class::<Method>()?;
+    m.add_class::<Closure>()?;
+    m.add_class::<Class>()?;
+    m.add_class::<Trait>()?;
+    m.add_class::<ClassConstants>()?;
+    m.add_class::<ClassConstant>()?;
+    m.add_class::<ClassVariables>()?;
+    m.add_class::<ClassVariable>()?;
+    m.add_class::<Interface>()?;
+    m.add_class::<AssignOp>()?;
+    m.add_class::<BinaryOp>()?;
+    m.add_class::<UnaryOp>()?;
+    m.add_class::<TernaryOp>()?;
+    m.add_class::<PreIncDecOp>()?;
+    m.add_class::<PostIncDecOp>()?;
+    m.add_class::<Cast>()?;
+    m.add_class::<IsSet>()?;
+    m.add_class::<Empty>()?;
+    m.add_class::<Eval>()?;
+    m.add_class::<Include>()?;
+    m.add_class::<Require>()?;
+    m.add_class::<Exit>()?;
+    m.add_class::<Silence>()?;
+    m.add_class::<MagicConstant>()?;
+    m.add_class::<Constant>()?;
+    m.add_class::<Variable>()?;
+    m.add_class::<StaticVariable>()?;
+    m.add_class::<LexicalVariable>()?;
+    m.add_class::<FormalParameter>()?;
+    m.add_class::<Parameter>()?;
+    m.add_class::<FunctionCall>()?;
+    m.add_class::<Array>()?;
+    m.add_class::<ArrayElement>()?;
+    m.add_class::<ArrayOffset>()?;
+    m.add_class::<StringOffset>()?;
+    m.add_class::<ObjectProperty>()?;
+    m.add_class::<StaticProperty>()?;
+    m.add_class::<MethodCall>()?;
+    m.add_class::<StaticMethodCall>()?;
+    m.add_class::<If>()?;
+    m.add_class::<ElseIf>()?;
+    m.add_class::<Else>()?;
+    m.add_class::<While>()?;
+    m.add_class::<DoWhile>()?;
+    m.add_class::<For>()?;
+    m.add_class::<Foreach>()?;
+    m.add_class::<ForeachVariable>()?;
+    m.add_class::<Switch>()?;
+    m.add_class::<Case>()?;
+    m.add_class::<Default>()?;
+    m.add_class::<UseDeclarations>()?;
+    m.add_class::<UseDeclaration>()?;
+    m.add_class::<ConstantDeclarations>()?;
+    m.add_class::<ConstantDeclaration>()?;
+    m.add_class::<TraitUse>()?;
+    m.add_class::<TraitModifier>()?;
+    m.add_class::<MatchExpr>()?;
+    m.add_class::<MatchArm>()?;
+    m.add_class::<NamedArgument>()?;
+    m.add_class::<NullsafePropertyAccess>()?;
+    m.add_class::<NullsafeCall>()?;
+    m.add_class::<ConstructorParameter>()?;
+    Ok(())
+}
