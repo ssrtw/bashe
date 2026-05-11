@@ -2,8 +2,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 macro_rules! field_name_str {
-    (type_) => { "type" };
-    ($f:ident) => { stringify!($f) };
+    (type_) => {
+        "type"
+    };
+    ($f:ident) => {
+        stringify!($f)
+    };
 }
 
 macro_rules! ast_node {

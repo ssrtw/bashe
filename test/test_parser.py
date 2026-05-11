@@ -1,6 +1,5 @@
 # ruff: noqa: F403, F405
 from bashe import *
-
 from test.util import eq_ast
 
 

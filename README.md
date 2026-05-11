@@ -83,8 +83,8 @@ Bashe uses its own fast native AST types (`Variable`, `FunctionCall`,
 ## Development
 
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
+# Install dependencies and dev tools
+uv sync --dev
 
 # Run tests
 uv run pytest

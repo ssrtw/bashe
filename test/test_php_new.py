@@ -27,7 +27,6 @@ from bashe import (
     TraitUse,
     Variable,
 )
-
 from test.util import eq_ast
 
 # ═══════════════════════════════════════════════════════════════════════

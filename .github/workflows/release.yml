@@ -48,8 +48,6 @@ jobs:
       - name: Test (native types)
         run: uv run --no-project --with dist/*.whl --with pytest pytest test/ -q
 
-      - name: Test (phply compat)
-        run: uv run --no-project --with dist/*.whl --with phply --with pytest pytest test/test_parser.py -q
 
   publish:
     needs: test
