@@ -26,7 +26,8 @@ full PHP 7/8 support — and runs **5× faster** than phply.
   happen entirely in native code
 - Known limitation: curly-brace string offset (`$str{0}`) is not
   supported; this syntax was deprecated in PHP 7.4 and removed in
-  PHP 8.0. Use bracket offset (`$str[0]`) instead
+  PHP 8.0. For PHP 5/7 code, use `fixup_curly_offsets()` to convert
+  `$str{0}` into equivalent `ArrayOffset` nodes
 
 ## Installation
 
